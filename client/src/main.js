@@ -50,6 +50,7 @@ let myBroadcast = null;
 // trocar de sala: é preferência de quem assiste, não estado de uma transmissão.
 // Zero é o mudo — um número só, em vez de dois estados que precisam concordar.
 let volume = Math.min(1, Math.max(0, Number(read('volume') ?? 1)));
+let fsrEnabled = read('fsrEnabled') === 'true';
 
 /**
  * Volume de cada pessoa, separado do volume geral.
@@ -80,6 +81,20 @@ function aplicarVolume(slot) {
   // Pela conexão direta o som sai do próprio <video>, e não do decodificador
   // de áudio — o mesmo controle precisa alcançar os dois.
   if (s.video) s.video.volume = Math.min(1, volumeEfetivo(s.userId));
+}
+
+function applyFSR() {
+  const btn = $('fsrToggle');
+  if (btn) {
+    btn.classList.toggle('on', fsrEnabled);
+    btn.dataset.tip = fsrEnabled ? 'Desligar FSR/Nitidez' : 'Ligar FSR/Nitidez';
+    btn.setAttribute('aria-label', btn.dataset.tip);
+  }
+  for (const s of streams.values()) {
+    if (s.player && s.player.setFSR) {
+      s.player.setFSR(fsrEnabled);
+    }
+  }
 }
 // Para onde o botão de silenciar volta. Sem isto, desmutar cairia sempre em
 // 100%, ignorando o ajuste que a pessoa tinha feito.
@@ -191,6 +206,7 @@ function watchSlot(slot) {
     openStream(slot, info.userId);
     startStream(slot, info.config);
   }
+  applyFSR();
   renderGrid();
 }
 
@@ -359,6 +375,7 @@ function renderGrid() {
   // tile — dois caminhos, um lugar só para avisar.
   const podeIrAoSite = inDiscord && noPalco && Boolean(origemDoSite());
   $('watchSite').hidden = !podeIrAoSite;
+  if ($('fsrToggle')) $('fsrToggle').hidden = !noPalco;
 
   if (!hasPeople) return;
 
@@ -940,6 +957,14 @@ function openStream(slot, userId) {
         s.started = true;
         renderGrid();
       },
+      onNeedKeyframe: () => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'need-keyframe', slot }));
+        }
+      },
+      onFallback2D: (novoCanvas) => {
+        s.canvas = novoCanvas;
+      },
     }),
     // Só nasce quando a transmissão anuncia que tem som — nem toda tem.
     audio: null,
@@ -1455,6 +1480,7 @@ function limparSala() {
   if (roomInfo) remove(`sala:${roomInfo.id}`);
   roomTokens = null;
   roomInfo = null;
+  if (session) delete session.sala;
   setRoomUrl(null);
 
   ws?.close();
@@ -1752,8 +1778,8 @@ async function authDiscord(fonteDoId) {
     response_type: 'code',
     state: '',
     prompt: 'none',
-    // Só precisamos de /users/@me. Menos escopo, menos atrito no consentimento.
-    scope: ['identify'],
+    // Precisamos de /users/@me e /users/@me/guilds para travar acesso fora dos servidores do bot.
+    scope: ['identify', 'guilds'],
   });
 
   const { access_token } = await post(`${P}/api/token`, { code, client_id: clientId });
@@ -1868,19 +1894,24 @@ function connect() {
     }
   });
 
-  ws.addEventListener('message', (e) => {
+  ws.addEventListener('message', async (e) => {
+    let data = e.data;
+    if (data instanceof Blob) {
+      data = await data.arrayBuffer();
+    }
+
     // Primeiro byte é o slot, segundo é o tipo: um diz de quem, o outro diz
     // para qual decodificador — som e imagem dividem o mesmo canal.
-    if (typeof e.data !== 'string') {
-      const view = new DataView(e.data);
+    if (typeof data !== 'string') {
+      const view = new DataView(data);
       const s = streams.get(view.getUint8(0));
       if (!s) return;
-      if (view.getUint8(1) === 3) s.audio?.push(e.data);
-      else s.player.push(e.data);
+      if (view.getUint8(1) === 3) s.audio?.push(data);
+      else s.player.push(data);
       return;
     }
 
-    const msg = JSON.parse(e.data);
+    const msg = JSON.parse(data);
 
     // Sinalização da conexão direta, repassada por quem transmite.
     if (msg.type === 'rtc' && Number.isInteger(msg.slot)) {
@@ -1901,6 +1932,9 @@ function connect() {
         `${lastRoomState?.locked ? '🔒 ' : ''}${lastRoomState?.name ?? ''}`;
       $('roomSettings').hidden = lastRoomState?.ownerId !== session?.user?.id;
       $('roomSettings').classList.toggle('on', Boolean(lastRoomState?.locked));
+      
+      const debugEl = $('room-debug');
+      if (debugEl) debugEl.textContent = `Sala: ${lastRoomState?.id ?? '?'}`;
 
       // Limpa o que sumiu sem stream-stop (queda abrupta, por exemplo).
       const live = new Set((msg.streams ?? []).map((s) => s.slot));
@@ -2487,3 +2521,11 @@ $('probe').addEventListener('click', async () => {
     toast(`Bloqueado (${err.name}): ${err.message}`, true);
   }
 });
+
+
+$('fsrToggle')?.addEventListener('click', () => {
+  fsrEnabled = !fsrEnabled;
+  store('fsrEnabled', fsrEnabled ? 'true' : 'false');
+  applyFSR();
+});
+

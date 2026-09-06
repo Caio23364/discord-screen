@@ -24,7 +24,6 @@ process.env.PUBLIC_ORIGIN = 'https://exemplo.test';
 
 vi.spyOn(console, 'log').mockImplementation(() => {});
 vi.spyOn(console, 'warn').mockImplementation(() => {});
-vi.spyOn(console, 'error').mockImplementation(() => {});
 
 const fetchReal = globalThis.fetch;
 const { server, wss } = await import('./index.js');
@@ -38,7 +37,7 @@ const finge = (padrao, responder) => externas.push([padrao, responder]);
 
 vi.stubGlobal('fetch', async (url, init) => {
   const alvo = String(url);
-  for (const [padrao, responder] of externas) {
+  for (const [padrao, responder] of [...externas].reverse()) {
     const bate = padrao instanceof RegExp ? padrao.test(alvo) : alvo.startsWith(padrao);
     if (bate) return responder(alvo, init);
   }
@@ -72,6 +71,8 @@ const perfil =
 
 beforeEach(() => {
   externas = [];
+  finge('https://discord.com/api/v10/users/@me/guilds', () => json([{ id: 'shared-guild' }]));
+  finge('https://discord.com/api/users/@me/guilds', () => json([{ id: 'shared-guild' }]));
 });
 
 afterAll(async () => {
@@ -127,7 +128,7 @@ describe('presença na call, confirmada pelo bot', () => {
   function comVoz(resposta, guild = GUILD) {
     finge(new RegExp(`/guilds/${guild}/voice-states/`), resposta);
     finge(new RegExp(`/guilds/${guild}$`), () => json({ name: 'Servidor' }));
-    finge('https://discord.com/api/users/@me', perfil(ADMIN));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
   }
 
   const abrir = (guild = GUILD, channel = CANAL) =>
@@ -155,6 +156,20 @@ describe('presença na call, confirmada pelo bot', () => {
 
     expect(resposta.status).toBe(403);
     expect((await resposta.json()).error).toMatch(/Entre na call/);
+  });
+
+  it('barra quem não compartilha nenhum servidor com o bot', async () => {
+    const guild = '100000000000000003';
+    finge(new RegExp(`/guilds/${guild}/voice-states/`), () => json({ channel_id: CANAL }));
+    finge(new RegExp(`/guilds/${guild}$`), () => json({ name: 'Servidor' }));
+    finge('https://discord.com/api/v10/users/@me/guilds', () => json([{ id: 'bot-guild' }]));
+    finge('https://discord.com/api/users/@me/guilds', () => json([{ id: 'user-guild' }]));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
+
+    const resposta = await abrir(guild);
+
+    expect(resposta.status).toBe(403);
+    expect((await resposta.json()).error).toMatch(/mesmo servidor/);
   });
 
   it('404 sem estado de voz é ausência: barra', async () => {
@@ -202,7 +217,7 @@ describe('nome do servidor', () => {
       idas++;
       return json({ name: 'Servidor' });
     });
-    finge('https://discord.com/api/users/@me', perfil(ADMIN));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
 
     const abrir = () =>
       post('/api/session', { access_token: 'tok', instance_id: 'i', guild_id: guild });
@@ -215,7 +230,7 @@ describe('nome do servidor', () => {
   it('vira null quando o bot não enxerga o servidor', async () => {
     const guild = '300000000000000002';
     finge(new RegExp(`/guilds/${guild}$`), () => json({ message: 'Unknown Guild' }, 403));
-    finge('https://discord.com/api/users/@me', perfil(ADMIN));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
 
     const corpo = await (
       await post('/api/session', { access_token: 'tok', instance_id: 'i', guild_id: guild })
@@ -229,7 +244,7 @@ describe('nome do servidor', () => {
     finge(new RegExp(`/guilds/${guild}$`), () => {
       throw new Error('sem resposta');
     });
-    finge('https://discord.com/api/users/@me', perfil(ADMIN));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
 
     const corpo = await (
       await post('/api/session', { access_token: 'tok', instance_id: 'i', guild_id: guild })
@@ -252,16 +267,27 @@ describe('login administrativo', () => {
 
   it('recusa uma conta que não é a do painel', async () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
-    finge('https://discord.com/api/users/@me', perfil(OUTRO));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(OUTRO));
 
     const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
 
     expect(resposta.headers.get('location')).toBe('/admin?error=forbidden');
   });
 
+  it('recusa um admin que não compartilha servidor com o bot', async () => {
+    finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
+    finge('https://discord.com/api/v10/users/@me/guilds', () => json([{ id: 'g1' }]));
+    finge('https://discord.com/api/users/@me/guilds', () => json([{ id: 'g2' }]));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
+
+    const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
+
+    expect(resposta.headers.get('location')).toBe('/admin?error=not_in_server');
+  });
+
   it('emite o cookie de sessão, marcado Secure em https', async () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
-    finge('https://discord.com/api/users/@me', perfil(ADMIN));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, perfil(ADMIN));
 
     const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
     const cookie = resposta.headers.get('set-cookie');
@@ -281,7 +307,7 @@ describe('login administrativo', () => {
 
   it('perfil que não vem também volta para o painel', async () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
-    finge('https://discord.com/api/users/@me', () => json({}));
+    finge(/^https:\/\/discord\.com\/api\/users\/@me$/, () => json({}));
 
     const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
 

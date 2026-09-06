@@ -56,8 +56,67 @@ const AJUSTE_MS = 2000;
 /** Correção máxima por ajuste: acima disso a mudança de ritmo se vê. */
 const PASSO_MAX_MS = 15;
 
-export function createPlayer(canvas, { onError, onTamanho } = {}) {
-  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFallback2D } = {}) {
+  let isWebGL = false;
+  let gl = canvas.getContext('webgl2', { alpha: false, desynchronized: true });
+  let ctx = null;
+  
+  let program = null;
+  let tex = null;
+  let locResolution = null;
+  let locSharpness = null;
+  let fsrEnabled = false;
+
+  if (gl && typeof gl.createProgram === 'function') {
+    isWebGL = true;
+    const vsSource = "#version 300 es\nin vec2 a_position;\nin vec2 a_texcoord;\nout vec2 v_texcoord;\nvoid main() {\n  gl_Position = vec4(a_position, 0.0, 1.0);\n  v_texcoord = a_texcoord;\n}";
+    const fsSource = "#version 300 es\nprecision highp float;\nin vec2 v_texcoord;\nuniform sampler2D u_texture;\nuniform vec2 u_resolution;\nuniform float u_sharpness;\nout vec4 outColor;\nvoid main() {\n  if (u_sharpness <= 0.0) {\n    outColor = texture(u_texture, v_texcoord);\n    return;\n  }\n  vec2 step = 1.0 / u_resolution;\n  vec3 c = texture(u_texture, v_texcoord).rgb;\n  vec3 tc = texture(u_texture, v_texcoord + vec2(0.0, -step.y)).rgb;\n  vec3 bc = texture(u_texture, v_texcoord + vec2(0.0, step.y)).rgb;\n  vec3 lc = texture(u_texture, v_texcoord + vec2(-step.x, 0.0)).rgb;\n  vec3 rc = texture(u_texture, v_texcoord + vec2(step.x, 0.0)).rgb;\n  vec3 blurred = (tc + bc + lc + rc) * 0.25;\n  vec3 sharp = c + (c - blurred) * u_sharpness;\n  outColor = vec4(sharp, 1.0);\n}";
+    const compile = (type, src) => {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, src);
+      gl.compileShader(shader);
+      return shader;
+    };
+    program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(program);
+    gl.useProgram(program);
+
+    const posBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+    const texBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1, 1,1, 0,0, 0,0, 1,1, 1,0]), gl.STATIC_DRAW);
+
+    const locPos = gl.getAttribLocation(program, 'a_position');
+    gl.enableVertexAttribArray(locPos);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, 0, 0);
+
+    const locTex = gl.getAttribLocation(program, 'a_texcoord');
+    gl.enableVertexAttribArray(locTex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+    gl.vertexAttribPointer(locTex, 2, gl.FLOAT, false, 0, 0);
+
+    locResolution = gl.getUniformLocation(program, 'u_resolution');
+    locSharpness = gl.getUniformLocation(program, 'u_sharpness');
+
+    tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  } else {
+    ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  }
+
+  function setFSR(enabled) {
+    fsrEnabled = enabled;
+  }
 
   let decoder = null;
   let needKeyframe = true;
@@ -85,8 +144,11 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
   // desse intervalo é idêntico a um travamento.
   let virgem = true;
 
+  let lastRawConfig = null;
+
   function start(rawConfig) {
     stop();
+    lastRawConfig = rawConfig;
 
     if (!window.VideoDecoder) {
       onError?.('Este navegador não tem WebCodecs — não é possível assistir.');
@@ -102,6 +164,8 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
         // pedir um keyframe recupera sem derrubar a sessão.
         console.warn('[decoder]', err.message);
         needKeyframe = true;
+        onNeedKeyframe?.();
+        if (lastRawConfig) setTimeout(() => start(lastRawConfig), 10);
       },
     });
 
@@ -143,16 +207,10 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     } catch (err) {
       console.warn('[decode]', err.message);
       needKeyframe = true;
+      onNeedKeyframe?.();
     }
   }
 
-  /**
-   * Um quadro decodificado entra na fila com a hora marcada para aparecer.
-   *
-   * A hora vem do timestamp da captura, e não do relógio de chegada: é assim
-   * que o intervalo entre dois quadros na tela volta a ser o intervalo com que
-   * eles foram capturados, independente de como a rede os entregou.
-   */
   function draw(frame) {
     const agora = performance.now();
     const tsMs = (frame.timestamp ?? 0) / 1000;
@@ -261,10 +319,43 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
       canvas.width = frame.displayWidth;
       canvas.height = frame.displayHeight;
+      if (isWebGL) {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
       mudou = true;
     }
 
-    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    let webglError = false;
+
+    if (isWebGL) {
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+        gl.uniform2f(locResolution, canvas.width, canvas.height);
+        gl.uniform1f(locSharpness, fsrEnabled ? 1.5 : 0.0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      } catch (err) {
+        console.warn('[webgl] Falha ao renderizar quadro, voltando para 2D:', err.message);
+        isWebGL = false;
+        webglError = true;
+        
+        const novo = document.createElement('canvas');
+        novo.className = canvas.className;
+        novo.width = canvas.width;
+        novo.height = canvas.height;
+        
+        if (canvas.parentNode) canvas.parentNode.replaceChild(novo, canvas);
+        canvas = novo;
+        ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+        
+        // Avisa o chamador para atualizar sua própria referência
+        onFallback2D?.(novo);
+      }
+    }
+    
+    if (!isWebGL && (ctx || webglError)) {
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    }
 
     // VideoFrame segura memória de GPU; sem close() a aba trava em segundos.
     frame.close();
@@ -294,8 +385,13 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     ultimoTs = -Infinity;
     irregularidade = null;
     if (canvas.width && canvas.height) {
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (isWebGL) {
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      } else {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
     }
   }
 
@@ -326,7 +422,7 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     return n;
   }
 
-  return { start, push, stop, getLag, getJitter, takeFrameCount, getSizes };
+  return { start, push, stop, getLag, getJitter, takeFrameCount, getSizes, setFSR };
 }
 
 function deserialize(c) {

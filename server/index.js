@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+import cors from 'cors';
 
 import { signToken, verifyToken } from './tokens.js';
 import * as R from './rooms.js';
@@ -88,6 +92,8 @@ for (const id of ADMIN_IDS) {
 if (TEM_ADMIN) startSampling();
 
 const app = express();
+app.set('trust proxy', 1);
+app.use(cors());
 
 // O proxy do Discord entrega as requisições da Activity sob o prefixo /.proxy.
 // Se ele chega até aqui, toda rota vira 404 e o cliente espera para sempre por
@@ -113,6 +119,34 @@ app.use((req, _res, next) => {
   }
   next();
 });
+
+const apiLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 100,
+  message: { error: 'Muitas requisições desta IP, tente novamente em 5 minutos' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => Boolean(process.env.VITEST),
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Muitas tentativas de login. Tente mais tarde.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => Boolean(process.env.VITEST),
+});
+
+app.use(helmet({
+  contentSecurityPolicy: false,
+  xFrameOptions: false,
+}));
+
+app.use('/api/', apiLimiter);
+app.use('/auth/login', loginLimiter);
+app.use('/admin/auth/login', loginLimiter);
+app.use('/auth/desktop', loginLimiter);
 
 app.use(express.json());
 
@@ -244,18 +278,27 @@ app.post('/api/session', async (req, res) => {
   }
 
   try {
-    const me = await fetch('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${access_token}` },
-    }).then((r) => r.json());
+    const guildId = /^[0-9]{15,21}$/.test(String(guild_id ?? '')) ? String(guild_id) : null;
+    const channelId = /^[0-9]{15,21}$/.test(String(channel_id ?? '')) ? String(channel_id) : null;
+
+    // Dispara requests em paralelo para reduzir a latência total ("Está demorando...")
+    const [me, guildName] = await Promise.all([
+      fetch('https://discord.com/api/users/@me', {
+        headers: { Authorization: `Bearer ${access_token}` },
+        signal: AbortSignal.timeout(5000),
+      }).then((r) => r.json()),
+      resolveGuildName(guildId),
+    ]);
 
     if (!me?.id) return res.status(401).json({ error: 'token invalido' });
 
-    const guildId = /^[0-9]{15,21}$/.test(String(guild_id ?? '')) ? String(guild_id) : null;
-    const channelId = /^[0-9]{15,21}$/.test(String(channel_id ?? '')) ? String(channel_id) : null;
-    const [presenca, guildName] = await Promise.all([
-      inVoiceChannel(guildId, channelId, me.id),
-      resolveGuildName(guildId),
-    ]);
+    // Trava de servidor compartilhado
+    const shared = await hasSharedGuild(access_token, guildId);
+    if (!shared) {
+      return res.status(403).json({ error: 'Você precisa estar no mesmo servidor que o bot para usar o aplicativo.' });
+    }
+
+    const presenca = await inVoiceChannel(guildId, channelId, me.id);
     if (presenca === 'fora') {
       return res.status(403).json({ error: 'Entre na call antes de abrir a atividade.' });
     }
@@ -357,6 +400,65 @@ function issueIdentity(instance, uid, name, avatar, ttl = 8 * 60 * 60, extra = {
 }
 
 const guildCache = new Map();
+const GUILD_CACHE_MAX = 500;
+
+let botGuildsCache = null;
+let botGuildsCacheTime = 0;
+
+async function getBotGuilds() {
+  if (!DISCORD_BOT_TOKEN) return new Set();
+  
+  if (Date.now() - botGuildsCacheTime < 5 * 60 * 1000 && botGuildsCache) {
+    return botGuildsCache;
+  }
+  
+  try {
+    const res = await fetch('https://discord.com/api/users/@me/guilds', {
+      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const guilds = await res.json();
+      botGuildsCache = new Set(guilds.map((g) => g.id));
+      botGuildsCacheTime = Date.now();
+    }
+  } catch (err) {
+    console.error('[bot] Erro ao buscar guilds do bot:', err);
+  }
+  
+  return botGuildsCache || new Set();
+}
+
+/**
+ * Garante que a pessoa tem pelo menos um servidor em comum com o bot.
+ */
+async function hasSharedGuild(userAccessToken, guildId) {
+  if (!DISCORD_BOT_TOKEN) return true;
+  
+  const botGuilds = await getBotGuilds();
+  // Se não conseguiu buscar do bot, não tranca pra fora, senão falha da API derruba todos.
+  if (botGuilds.size === 0) return true;
+  
+  // Caminho rápido: se o bot está na guild atual, já compartilha.
+  // Evita um request extra e não esbarra no problema de falta de permissão 'guilds'.
+  if (guildId && botGuilds.has(guildId)) return true;
+  
+  try {
+    const res = await fetch('https://discord.com/api/users/@me/guilds', {
+      headers: { Authorization: `Bearer ${userAccessToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    
+    if (!res.ok) return false;
+    
+    const userGuilds = await res.json();
+    return userGuilds.some((g) => botGuilds.has(g.id));
+  } catch (err) {
+    console.error('[user] Erro ao buscar guilds do usuario:', err);
+    // Timeout de rede não deve bloquear login se o access_token não é o problema.
+    return true;
+  }
+}
 
 /**
  * O nome de um servidor, pelo bot.
@@ -385,6 +487,9 @@ async function resolveGuildName(guildId) {
     name = null;
   }
 
+  if (guildCache.size >= GUILD_CACHE_MAX) {
+    guildCache.delete(guildCache.keys().next().value);
+  }
   guildCache.set(guildId, {
     name,
     expiresAt: Date.now() + (name ? 60 * 60 * 1000 : 10 * 60 * 1000),
@@ -402,7 +507,10 @@ async function resolveGuildName(guildId) {
  * @returns {'ok'|'fora'|'indisponivel'}
  */
 async function inVoiceChannel(guildId, channelId, userId) {
-  if (!DISCORD_BOT_TOKEN || !guildId || !channelId) return 'indisponivel';
+  // Em chamadas DM (sem guildId) ou se o servidor não tiver bot configurado,
+  // não temos como verificar o estado de voz. Precisamos confiar no client,
+  // senão a Activity entra em uma sala isolada (atividade-uuid) e o Desktop em outra.
+  if (!DISCORD_BOT_TOKEN || !guildId || !channelId) return channelId ? 'ok' : 'indisponivel';
 
   try {
     const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/voice-states/${userId}`, {
@@ -576,14 +684,77 @@ app.post('/api/rooms/create', (req, res) => {
  */
 const salaDaCall = (me) => (me.call ? `call-${me.call}` : `atividade-${me.instance}`);
 
-app.post('/api/rooms/call', (req, res) => {
+app.post('/api/rooms/call', async (req, res) => {
   const me = identityOf(req, res);
   if (!me) return;
 
+  // Se o token já tem a call gravada, usamos direto
+  let resolvedGuild = me.guild ?? null;
+  let resolvedGuildName = me.guildName ?? null;
+  let resolvedChannel = me.channel ?? me.call ?? null;
+
+  // Se não tem no token (ex: logou antes de entrar na call), tentamos achar agora
+  if (!resolvedChannel && DISCORD_BOT_TOKEN) {
+    try {
+      const botGuilds = await getBotGuilds();
+      if (botGuilds.size > 0) {
+        let achou = null;
+        const guildsArray = Array.from(botGuilds);
+        
+        // Controle simples de concorrência com bail-out: varre até 5 guilds por vez
+        // Se encontrar em um batch, interrompe a busca e evita spam (HTTP 429) na API do Discord
+        const maxConcurrent = 5;
+        for (let i = 0; i < guildsArray.length && !achou; i += maxConcurrent) {
+          const batch = guildsArray.slice(i, i + maxConcurrent);
+          const voiceChecks = await Promise.all(
+            batch.map(async (gId) => {
+              if (achou) return null; // Bail-out de segurança
+              try {
+                const vsRes = await fetch(
+                  `https://discord.com/api/v10/guilds/${gId}/voice-states/${me.uid}`,
+                  {
+                    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+                    signal: AbortSignal.timeout(3000),
+                  }
+                );
+                if (vsRes.ok) {
+                  const vs = await vsRes.json();
+                  if (vs?.channel_id) return { guildId: gId, channelId: vs.channel_id };
+                }
+              } catch (err) {
+                // Ignore timeout/network errors
+              }
+              return null;
+            })
+          );
+          achou = voiceChecks.find(Boolean);
+        }
+
+        if (achou) {
+          console.log(`[rooms/call] Usuário ${me.name} detectado na call ${achou.channelId} agora!`);
+          resolvedGuild = achou.guildId;
+          resolvedChannel = achou.channelId;
+          
+          // Tentar buscar o nome do servidor para ficar bonitinho
+          resolvedGuildName = await resolveGuildName(achou.guildId);
+          
+          // Atualiza a instância do usuário para essa requisição
+          me.instance = `call-${resolvedChannel}`;
+          me.call = resolvedChannel;
+          me.channel = resolvedChannel;
+          me.guild = resolvedGuild;
+          me.guildName = resolvedGuildName;
+        }
+      }
+    } catch (err) {
+      console.warn('[rooms/call] Erro ao buscar call do usuário dinamicamente:', err);
+    }
+  }
+
   const room = R.ensureCallRoom(me.instance, salaDaCall(me), {
-    guildId: me.guild ?? null,
-    guildName: me.guildName ?? null,
-    channelId: me.channel ?? me.call ?? null,
+    guildId: resolvedGuild,
+    guildName: resolvedGuildName,
+    channelId: resolvedChannel,
   });
   res.json(issueRoomTokens(room.id, me));
 });
@@ -676,14 +847,26 @@ function discordAuthorizeUrl(state = null) {
   url.searchParams.set('client_id', DISCORD_CLIENT_ID);
   url.searchParams.set('redirect_uri', REDIRECT_URI);
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('scope', 'identify');
+  url.searchParams.set('scope', 'identify guilds');
   if (state) url.searchParams.set('state', state);
   return url;
 }
 
 app.get('/auth/login', (_req, res) => {
-  const url = discordAuthorizeUrl();
+  const state = signToken(
+    { scope: 'oauth-state', target: 'user', nonce: crypto.randomBytes(12).toString('base64url') },
+    10 * 60,
+  );
+  const url = discordAuthorizeUrl(state);
   res.redirect(url.toString());
+});
+
+app.get('/auth/desktop', (_req, res) => {
+  const state = signToken(
+    { scope: 'oauth-state', target: 'desktop', nonce: crypto.randomBytes(12).toString('base64url') },
+    10 * 60,
+  );
+  res.redirect(discordAuthorizeUrl(state).toString());
 });
 
 app.get('/admin/auth/login', (_req, res) => {
@@ -703,7 +886,10 @@ app.get('/auth/callback', async (req, res) => {
   const { code, state } = req.query;
   const oauthState = verifyToken(typeof state === 'string' ? state : '');
   const adminFlow = oauthState?.scope === 'oauth-state' && oauthState.target === 'admin';
-  if (!code) return res.redirect(adminFlow ? '/admin?error=sem_codigo' : '/?erro=sem_codigo');
+  const userFlow = oauthState?.scope === 'oauth-state' && oauthState.target === 'user';
+  const desktopFlow = oauthState?.scope === 'oauth-state' && oauthState.target === 'desktop';
+  const isTest = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+  if (!code || (!adminFlow && !userFlow && !desktopFlow && !isTest)) return res.redirect(adminFlow ? '/admin?error=sem_codigo' : '/?erro=sem_codigo');
 
   try {
     const token = await fetch('https://discord.com/api/oauth2/token', {
@@ -730,6 +916,11 @@ app.get('/auth/callback', async (req, res) => {
       return res.redirect(adminFlow ? '/admin?error=perfil_falhou' : '/?erro=perfil_falhou');
     }
 
+    const shared = await hasSharedGuild(token.access_token);
+    if (!shared) {
+      return res.redirect(adminFlow ? '/admin?error=not_in_server' : '/?erro=not_in_server');
+    }
+
     if (adminFlow) {
       if (!ADMIN_IDS.has(me.id)) return res.redirect('/admin?error=forbidden');
 
@@ -748,6 +939,64 @@ app.get('/auth/callback', async (req, res) => {
         `${ADMIN_COOKIE}=${adminSession}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${8 * 60 * 60}${secure}`,
       );
       return res.redirect('/admin');
+    }
+
+    if (desktopFlow) {
+      let callInfo = {};
+      if (DISCORD_BOT_TOKEN) {
+        try {
+          const botGuilds = await getBotGuilds();
+          const userGuildsRes = await fetch('https://discord.com/api/users/@me/guilds', {
+            headers: { Authorization: `Bearer ${token.access_token}` },
+            signal: AbortSignal.timeout(4000),
+          });
+          if (userGuildsRes.ok) {
+            const userGuilds = await userGuildsRes.json();
+            const comuns = userGuilds.filter((g) => botGuilds.has(g.id));
+            const voiceChecks = await Promise.all(
+              comuns.map(async (g) => {
+                try {
+                  const vsRes = await fetch(
+                    `https://discord.com/api/v10/guilds/${g.id}/voice-states/${me.id}`,
+                    {
+                      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+                      signal: AbortSignal.timeout(3000),
+                    },
+                  );
+                  if (vsRes.ok) {
+                    const vs = await vsRes.json();
+                    if (vs?.channel_id) return { guildId: g.id, channelId: vs.channel_id };
+                  }
+                } catch (err) {
+    // Ignora erro
+  }
+                return null;
+              }),
+            );
+            const achou = voiceChecks.find(Boolean);
+            if (achou) {
+              console.log(
+                `[desktop-oauth] Usuário ${me.username} detectado na call ${achou.channelId} (guild ${achou.guildId})`,
+              );
+              callInfo = { call: achou.channelId, channel: achou.channelId, guild: achou.guildId };
+            }
+          }
+        } catch (err) {
+          console.warn('[desktop-oauth] Erro ao buscar call do usuário:', err);
+        }
+      }
+
+      const instance = callInfo.call ? `call-${callInfo.call}` : WEB_INSTANCE;
+      const identity = issueIdentity(
+        instance,
+        me.id,
+        me.global_name || me.username,
+        me.avatar ?? null,
+        8 * 60 * 60,
+        callInfo,
+      );
+      // Redireciona para o servidor local temporário criado pelo app Desktop
+      return res.redirect(`http://127.0.0.1:13031/auth?identity=${encodeURIComponent(identity.identity)}`);
     }
 
     const identity = issueIdentity(
@@ -965,7 +1214,7 @@ wss.on('connection', (ws, _req, auth, fonte, controle) => {
   // A sala pode ter fechado entre a emissão do token e a conexão.
   if (!room) {
     R.sendJson(ws, { type: 'room-gone' });
-    ws.close();
+    setTimeout(() => ws.close(), 500);
     return;
   }
 
@@ -1039,7 +1288,7 @@ function handleBroadcaster(ws, room, info, fonte) {
       R.rtcParaViewer(room, entry, msg.peer, msg.payload);
     } else if (msg.type === 'stop') {
       R.stopStream(room, entry);
-      console.log(`[room ${room.id}] stream parada por ${info.name}`);
+      console.log(`[room ${room.id}] stream parada por ${info.name}. Motivo: ${msg.reason || 'Nenhum'}`);
     }
   });
 
@@ -1062,25 +1311,47 @@ function handleViewer(ws, room, auth) {
       return;
     }
 
-    // Nome exibido escolhido pela pessoa. Nada é persistido: vale enquanto a
-    // conexão durar, e some quando ela reabre a atividade.
+    if (typeof msg !== 'object' || Array.isArray(msg) || msg === null) {
+      ws.close(1008, 'Mensagem invalida');
+      return;
+    }
+
+    const viewerMsgSchema = z.discriminatedUnion('type', [
+      z.object({ type: z.literal('rename'), name: z.string() }),
+      z.object({ type: z.literal('watch'), slot: z.number().int() }),
+      z.object({ type: z.literal('unwatch'), slot: z.number().int() }),
+      z.object({ type: z.literal('rtc'), slot: z.number().int(), payload: z.any() }),
+      z.object({ type: z.literal('rtc-ativo'), slot: z.number().int(), on: z.boolean().optional() }),
+      z.object({ type: z.literal('need-keyframe'), slot: z.number().int() }),
+      z.object({ type: z.literal('start-broadcast'), fonte: z.string(), opcoes: z.any().optional() }),
+      z.object({ type: z.literal('config-broadcast'), opcoes: z.any() }),
+      z.object({ type: z.literal('stop-broadcast'), fonte: z.string().optional() }),
+    ]);
+
+    const parsed = viewerMsgSchema.safeParse(msg);
+    if (!parsed.success) return;
+    msg = parsed.data;
+
     if (msg.type === 'rename') {
       R.rename(room, ws, msg.name);
       return;
     }
 
-    if (msg.type === 'watch' && Number.isInteger(msg.slot)) {
+    if (msg.type === 'watch') {
       R.watch(room, ws, msg.slot);
       return;
     }
 
-    if (msg.type === 'unwatch' && Number.isInteger(msg.slot)) {
+    if (msg.type === 'unwatch') {
       R.unwatch(room, ws, msg.slot);
       return;
     }
 
-    // Envelope de sinalização a caminho de quem transmite. O servidor não abre:
-    // offer, answer e candidato só fazem sentido para as duas pontas.
+    if (msg.type === 'need-keyframe') {
+      R.requestKeyframeViewer(room, ws, msg.slot);
+      return;
+    }
+
     if (msg.type === 'rtc' && Number.isInteger(msg.slot) && msg.payload) {
       R.rtcParaBroadcaster(room, ws, msg.slot, msg.payload);
       return;

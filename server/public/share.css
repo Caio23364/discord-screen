@@ -1,12 +1,19 @@
 :root {
-  --bg: #1a1b1e;
-  --card: #232428;
-  --line: #35373c;
-  --text: #f2f3f5;
-  --muted: #9b9ea3;
-  --accent: #5865f2;
-  --danger: #da373c;
-  --ok: #23a55a;
+  --bg-color: #070913;
+  --panel-bg: rgba(20, 22, 35, 0.65);
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --text-main: #f2f3f7;
+  --text-muted: #8b94a5;
+  --accent-color: #9d4edd;
+  --accent-gradient: linear-gradient(135deg, #00b4d8, #7b2cbf);
+  --danger-color: #ef233c;
+  --danger-gradient: linear-gradient(135deg, #ef233c, #d90429);
+  --ok-color: #06d6a0;
+  --input-bg: rgba(10, 12, 20, 0.5);
+  --input-border: rgba(255, 255, 255, 0.1);
+  --input-focus: rgba(123, 44, 191, 0.4);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 24px rgba(123, 44, 191, 0.2);
 }
 
 * {
@@ -20,434 +27,573 @@
 body {
   margin: 0;
   min-height: 100vh;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 24px;
-  background: var(--bg);
-  color: var(--text);
-  font: 15px/1.5 "gg sans", "Segoe UI", system-ui, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  overflow-x: hidden;
+}
+
+@keyframes bgMove {
+  0% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-2%, -3%) scale(1.05); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+
+.app-background {
+  position: fixed;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: 
+    radial-gradient(circle at 40% 40%, rgba(123,44,191,0.15) 0%, transparent 40%),
+    radial-gradient(circle at 60% 60%, rgba(0,180,216,0.1) 0%, transparent 40%);
+  animation: bgMove 25s ease-in-out infinite alternate;
+  z-index: -1;
+  pointer-events: none;
+}
+
+.glass-panel {
+  background: var(--panel-bg);
+  backdrop-filter: blur(32px);
+  -webkit-backdrop-filter: blur(32px);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow-lg), inset 0 1px 0 rgba(255,255,255,0.05);
 }
 
 .card {
   width: 100%;
-  max-width: 520px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 28px;
+  max-width: 960px;
+  border-radius: 20px;
+  padding: 36px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
 }
 
-h1 {
-  margin: 0 0 4px;
-  font-size: 22px;
-}
-
-
-.row {
+/* Header */
+.app-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: 16px;
+  margin-bottom: 8px;
 }
 
-label {
-  color: var(--muted);
-  font-size: 14px;
+.header-icon {
+  width: 44px;
+  height: 44px;
+  background: var(--accent-gradient);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  box-shadow: var(--shadow-glow);
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Fontes / Blocos */
+.fontes {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+}
+
+@media (min-width: 800px) {
+  .fontes {
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+}
+
+.bloco {
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.015);
+  border-radius: 16px;
+  padding: 24px;
+  border: 1px solid var(--panel-border);
+  transition: all 0.3s ease;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+}
+
+.bloco:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255,255,255,0.15);
+}
+
+.bloco.chamando {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 1px var(--accent-color), var(--shadow-glow);
+}
+
+.bloco-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.bloco-header h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bloco.chamando .bloco-header h2 {
+  color: #fff;
+  text-shadow: 0 0 8px rgba(123,44,191,0.5);
+}
+
+/* Formulários */
+.ajustes {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.input-group label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.select-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.select-wrapper svg {
+  position: absolute;
+  right: 14px;
+  pointer-events: none;
+  color: var(--text-muted);
+  transition: color 0.2s;
 }
 
 select {
-  flex: 1;
-  max-width: 260px;
-  padding: 8px 10px;
-  background: #1e1f22;
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font: inherit;
+  width: 100%;
+  appearance: none;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-main);
+  padding: 12px 40px 12px 14px;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  outline: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
 }
 
-/* Duas colunas em telas com espaço, empilhado no aperto. */
-.ajustes {
+select:hover, select:focus {
+  border-color: rgba(255,255,255,0.2);
+}
+
+select:focus {
+  box-shadow: 0 0 0 3px var(--input-focus), inset 0 2px 4px rgba(0,0,0,0.2);
+}
+select:focus + svg {
+  color: #fff;
+}
+
+/* Toggle Switch (Discord Style + Modern Glow) */
+.toggle-group {
   display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin: 0 0 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
 }
 
-.ajustes label {
-  flex: 1 1 140px;
+.toggle-text {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
-.ajustes select {
-  max-width: none;
-}
-
-.check {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  margin: 18px 0 24px;
-  color: var(--text);
+.toggle-label {
   font-size: 14px;
+  font-weight: 500;
+}
+
+.toggle-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
   cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: rgba(255,255,255,0.15);
+  transition: .3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 24px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
 }
 
-.check em {
-  display: block;
-  color: var(--muted);
-  font-style: normal;
-  font-size: 13px;
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
 }
 
-.check input {
-  margin-top: 3px;
-  accent-color: var(--accent);
+input:checked + .slider {
+  background-color: var(--accent-color);
+  box-shadow: 0 0 8px rgba(123,44,191,0.5), inset 0 1px 2px rgba(0,0,0,0.2);
+}
+
+input:focus-visible + .slider {
+  box-shadow: 0 0 0 3px var(--input-focus);
+}
+
+input:checked + .slider:before {
+  transform: translateX(20px);
+}
+
+/* Previews */
+.preview-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--panel-border);
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 4px 20px rgba(0,0,0,0.5);
+  transition: border-color 0.3s;
+}
+
+.bloco.chamando .preview-container {
+  border-color: rgba(123,44,191,0.4);
+}
+
+video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.sem-preview {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-muted);
+}
+
+.sem-preview svg {
+  opacity: 0.5;
+}
+
+/* Botões e Ações */
+.acao {
+  display: flex;
+  gap: 12px;
+  position: relative;
+  margin-top: auto;
+}
+
+.live-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 20px;
 }
 
 button {
-  width: 100%;
-  padding: 12px 16px;
-  border: 0;
-  border-radius: 8px;
-  font: 600 15px/1 inherit;
-  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border: none;
+  border-radius: 10px;
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 14px;
   cursor: pointer;
-  transition: filter 0.15s;
-}
-
-button:hover:not(:disabled) {
-  filter: brightness(1.12);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  color: white;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.15), 0 2px 4px rgba(0,0,0,0.2);
 }
 
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none !important;
 }
 
-.primary {
-  background: var(--accent);
+button.primary {
+  background: var(--accent-gradient);
+  flex: 1;
 }
 
-.danger {
-  background: var(--danger);
+button.primary:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(123,44,191,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+button.primary:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+button.danger {
+  background: var(--danger-gradient);
+}
+
+button.danger:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(239,35,60,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+button.danger:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+button.secondary {
+  background-color: rgba(255,255,255,0.08);
+  box-shadow: none;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+button.secondary:hover:not(:disabled) {
+  background-color: rgba(255,255,255,0.15);
+  border-color: rgba(255,255,255,0.2);
+}
+
+.acao > .seta {
+  flex: 0 0 48px;
+  padding: 0;
+}
+
+/* Menus de Escolha */
+.menu {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  right: 0;
+  z-index: 10;
+  min-width: 260px;
+  background: rgba(20, 22, 35, 0.95);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 8px;
+  margin: 0;
+  list-style: none;
+  box-shadow: var(--shadow-lg), 0 0 0 1px rgba(255,255,255,0.05);
+  max-height: 220px;
+  overflow-y: auto;
+  transform-origin: bottom right;
+  animation: menuIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes menuIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.menu button {
+  width: 100%;
+  background: none;
+  padding: 12px 16px;
+  justify-content: flex-start;
+  font-weight: 500;
+  border-radius: 8px;
+  box-shadow: none;
+  border: none;
+}
+
+.menu button:hover {
+  background: rgba(255,255,255,0.08);
+  transform: none;
+  box-shadow: none;
+}
+
+.menu button[aria-checked='true'] {
+  color: #fff;
+  background: rgba(123,44,191,0.2);
+}
+
+.menu button[aria-checked='true']::before {
+  content: '✓';
+  margin-right: 8px;
+  color: var(--accent-color);
+}
+
+/* Badges e Estatísticas */
+.live-badge-wrapper {
+  margin-bottom: 16px;
 }
 
 .live-badge {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 14px;
-  padding: 5px 12px;
-  border-radius: 999px;
-  background: rgba(35, 165, 90, 0.14);
-  color: var(--ok);
-  font-size: 13px;
-  font-weight: 600;
+  padding: 6px 12px;
+  background: rgba(6, 214, 160, 0.15);
+  color: var(--ok-color);
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  box-shadow: 0 0 12px rgba(6,214,160,0.2);
 }
 
 .dot {
   width: 8px;
   height: 8px;
+  background: var(--ok-color);
   border-radius: 50%;
-  background: var(--ok);
-  animation: pulse 1.6s ease-in-out infinite;
+  animation: pulse 2s infinite ease-in-out;
+  box-shadow: 0 0 8px var(--ok-color);
 }
 
 @keyframes pulse {
-  50% {
-    opacity: 0.25;
-  }
-}
-
-video {
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #000;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  object-fit: contain;
-}
-
-
-.note {
-  margin: 18px 0 24px;
-  padding: 10px 12px;
-  border-radius: 6px;
-  background: #1e1f22;
-  color: var(--muted);
-  font-size: 13px;
+  0% { transform: scale(0.95); opacity: 1; box-shadow: 0 0 0 0 rgba(6,214,160,0.7); }
+  70% { transform: scale(1); opacity: 0.5; box-shadow: 0 0 0 6px rgba(6,214,160,0); }
+  100% { transform: scale(0.95); opacity: 1; box-shadow: 0 0 0 0 rgba(6,214,160,0); }
 }
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  margin: 16px 0;
-  text-align: center;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 20px;
 }
 
-.stats div {
-  padding: 10px 4px;
-  background: #1e1f22;
-  border-radius: 8px;
-}
-
-.stats strong {
-  display: block;
-  font-size: 17px;
-  font-variant-numeric: tabular-nums;
-}
-
-.stats span {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-/* As duas fontes lado a lado quando a janela deixa. Empilhadas, cada preview
-   empurra o outro para fora da tela — e é justamente com as duas no ar que se
-   precisa ver as duas. Abaixo do ponto de corte volta a ser uma coluna, que é
-   o que cabe. */
-.fontes {
-  margin-top: 18px;
-  display: grid;
-  gap: 24px;
-}
-
-@media (min-width: 900px) {
-  .fontes {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  /* Colunas da mesma altura, com a ação de cada uma encostada na base. Sem
-     isto o botão da tela desce sozinho — só ela tem a caixa de som — e as duas
-     ações, que são o mesmo gesto, ficam em alturas diferentes. */
-  .bloco {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .bloco > div {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-  }
-
-  /* O espaço livre vai todo para cima da ação, que é o que encosta na base das
-     duas colunas — assim elas terminam na mesma linha mesmo quando só uma tem
-     algo a dizer acima do botão.
-
-     Um `margin-top: auto` só por coluna: dois dividiriam a sobra entre eles e
-     nada encostaria em lugar nenhum. Por isso o botão azul cobre o bloco parado
-     e o vermelho cobre o bloco no ar — cada um existe só no seu, então nunca
-     aparecem os dois juntos. */
-  .bloco > div > .acao {
-    margin-top: auto;
-  }
-
-  .bloco > div > button.danger {
-    margin-top: auto;
+@media (min-width: 480px) {
+  .stats {
+    grid-template-columns: repeat(4, 1fr);
   }
 }
 
-/* O lugar do preview enquanto não há preview.
-
-   Só existe lado a lado: empilhado, uma caixa vazia do tamanho de um vídeo
-   empurraria a outra fonte para fora da tela, que é justamente o que o layout
-   de duas colunas foi feito para evitar. Em duas colunas ela é o contrário —
-   sem ela a coluna parada fica com um vão do tamanho do vídeo da outra, e as
-   duas ações, que são o mesmo gesto, desencontram na vertical. */
-.sem-preview {
-  display: none;
-  /* Cresce com a coluna. Com tamanho fixo ele sobra um vão morto acima do
-     botão assim que a outra fonte entra no ar e estica o lado de lá — o
-     `aspect-ratio` continua dando o tamanho mínimo, quando não há o que
-     preencher. */
-  flex: 1 1 auto;
-  width: 100%;
-  aspect-ratio: 16 / 9;
+.stat-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 12px;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  border: 1px dashed var(--line);
-  background: #1a1b1e;
-  color: var(--muted);
-  font-size: 13px;
-  /* Folga mínima até a ação. O `margin-top: auto` do botão já afasta os dois
-     quando a coluna sobra altura, mas quando não sobra eles encostavam. */
-  margin-bottom: 16px;
+  gap: 6px;
+  transition: background 0.3s;
 }
 
-/* Precisa vir depois da regra acima: media query não soma especificidade, então
-   entre duas declarações iguais quem ganha é a que está mais abaixo. */
-@media (min-width: 900px) {
-  .sem-preview {
-    display: flex;
-  }
+.stat-card:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
-/* Ação principal e a seta que a acompanha, na mesma linha.
-
-   A seta é irmã do botão, não um item dentro dele: são duas ações distintas —
-   escolher e transmitir — e um botão dentro de outro não existe em HTML. */
-.acao {
-  position: relative;
-  display: flex;
-  gap: 8px;
-}
-
-.acao > .primary {
-  flex: 1;
-  margin: 0;
-}
-
-.acao > .seta {
-  flex: 0 0 46px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.seta svg {
-  width: 18px;
-  height: 18px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-/* Abre para cima porque o botão fica na base da coluna: para baixo o menu
-   nasceria fora da página. */
-.menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 8px);
-  z-index: 5;
-  min-width: 240px;
-  max-width: 100%;
-  margin: 0;
-  padding: 6px;
-  list-style: none;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  background: #101114;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-}
-
-.menu button {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  margin: 0;
-  padding: 9px 10px;
-  border-radius: 6px;
-  background: none;
-  color: var(--text, #f2f3f5);
-  font-size: 13px;
-  text-align: left;
-}
-
-.menu button:hover {
-  background: rgba(255, 255, 255, 0.07);
-}
-
-/* O tique marca a escolhida. O espaço fica reservado nas outras para os nomes
-   começarem todos na mesma coluna. */
-.menu button::before {
-  content: '';
-  flex: 0 0 14px;
-  color: var(--accent, #5865f2);
-}
-
-.menu button[aria-checked='true']::before {
-  content: '✓';
-}
-
-/* A prévia ocupa o mesmo lugar do placeholder — um exclui o outro, e a folga
-   até a ação é a mesma nos dois. Só a prévia: o vídeo do bloco no ar já tem o
-   respiro das estatísticas logo abaixo. */
-#tela-previa,
-#camera-previa {
-  margin-bottom: 16px;
-}
-
-/* Um bloco por fonte. A régua acima separa sem gastar altura, que é o que
-   falta numa página que agora tem dois controles em vez de um. */
-.bloco {
-  padding-top: 16px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.bloco h2 {
-  margin: 0 0 12px;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+.stat-label {
+  font-size: 11px;
+  color: var(--text-muted);
   text-transform: uppercase;
-  opacity: 0.65;
+  letter-spacing: 0.05em;
+  font-weight: 600;
 }
 
-/* O bloco da fonte pedida pela atividade, enquanto ela espera um clique daqui.
-   Sem isto o pedido chega e nada na página muda de aparência. */
-.bloco.chamando {
-  border-top-color: var(--accent, #5865f2);
+.stat-card strong {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
 }
 
-.bloco.chamando h2 {
-  opacity: 1;
-  color: var(--accent, #5865f2);
+/* Informações extras */
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: rgba(123, 44, 191, 0.08);
+  padding: 14px;
+  border-radius: 12px;
+  margin-bottom: 20px;
+  border: 1px solid rgba(123, 44, 191, 0.15);
+}
+
+.note svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: #c77dff;
 }
 
 .status {
-  margin: 16px 0 0;
-  min-height: 20px;
-  font-size: 14px;
-  color: var(--muted);
-}
-
-/* Aviso nao e erro: o som foi descartado, mas a tela continua no ar. */
-.secondary {
-  margin-bottom: 10px;
-  background: #3a3d44;
-  color: #f2f3f5;
-}
-
-.secondary:hover {
-  background: #474b53;
-}
-
-.status.aviso {
-  color: #f0b232;
-}
-
-.status.error {
-  color: #ff8a8f;
-}
-
-.status.ok {
-  color: var(--ok);
-}
-
-footer p {
-  margin: 22px 0 0;
-  padding-top: 18px;
-  border-top: 1px solid var(--line);
-  color: var(--muted);
   font-size: 13px;
+  margin-top: 16px;
+  min-height: 20px;
+  color: var(--text-muted);
+  font-weight: 500;
 }
 
-/* O cartão só alarga quando há duas colunas para preencher. Mantido estreito
-   abaixo disso: linha de texto longa demais é pior de ler, e em coluna única
-   não há nada para ocupar a largura extra. */
-@media (min-width: 900px) {
-  .card {
-    max-width: 980px;
-  }
+.status.error { color: var(--danger-color); }
+.status.aviso { color: #f0b232; }
+
+.app-footer {
+  text-align: center;
+  padding-top: 28px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.app-footer p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
 }

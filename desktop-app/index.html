@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fabricio Desktop</title>
+    <!-- Modern Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <!-- Background dinâmico / decorativo -->
+    <div class="app-background">
+      <div class="glow-orb primary-orb"></div>
+      <div class="glow-orb secondary-orb"></div>
+    </div>
+
+    <div id="app">
+      <!-- Top Header -->
+      <header class="app-header glass-panel">
+        <div class="user-info">
+          <!-- Logo com a letra F ao invés de imagem estática, gerado pelo UI Avatars mas estilizável -->
+          <div class="avatar-container">
+            <img class="avatar" src="https://ui-avatars.com/api/?name=Fabricio&background=6b46c1&color=fff&font-size=0.6&bold=true" alt="Fabricio Avatar" id="user-avatar" />
+            <div class="avatar-status"></div>
+          </div>
+          <div class="user-details">
+            <h1 id="user-name">Fabricio</h1>
+            <p class="stream-stats">
+              <span class="status-indicator live"></span> LIVE • <span id="current-quality">1080p60</span> • <span id="viewer-count">0 Viewers</span>
+            </p>
+          </div>
+        </div>
+        <button class="icon-button outline" id="header-settings-btn" title="Configurações">
+          <i class="fa-solid fa-gear"></i>
+        </button>
+      </header>
+
+      <!-- Main Content / Preview -->
+      <main class="preview-container">
+        <!-- Placeholder for the video stream -->
+        <video id="stream-preview" autoplay muted playsinline></video>
+        
+        <!-- Empty state when not sharing -->
+        <div class="empty-state" id="empty-state">
+          <div class="empty-icon-wrapper">
+            <i class="fa-solid fa-display"></i>
+          </div>
+          <p>Nenhuma tela selecionada para transmitir</p>
+          <button class="primary-button" id="start-share-btn">
+            <i class="fa-solid fa-plus"></i> Iniciar Transmissão
+          </button>
+        </div>
+
+        <div class="preview-overlay">
+          <div class="current-app-info glass-panel">
+            <img class="app-icon" src="https://ui-avatars.com/api/?name=App&background=1a202c&color=fff" alt="App Icon" id="app-icon" />
+            <div class="app-details">
+              <h2 id="app-title">Selecionar Tela</h2>
+              <p id="app-subtitle">Aguardando...</p>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- Floating Settings Modal (Discord Style) -->
+      <div class="settings-modal hidden glass-panel" id="settings-modal">
+        <div class="settings-header">
+          <h3>Configurações de Transmissão</h3>
+        </div>
+        <div class="settings-body">
+          <div class="setting-item">
+            <div class="setting-text">
+              <span class="setting-label"><i class="fa-brands fa-discord"></i> Isolamento de Áudio</span>
+              <span class="setting-desc">Muta o Discord na gravação local</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="discord-mute-toggle" checked>
+              <span class="slider round"></span>
+            </label>
+          </div>
+          
+          <div class="setting-item">
+            <div class="setting-text">
+              <span class="setting-label"><i class="fa-solid fa-wand-magic-sparkles"></i> Bitrate Inteligente</span>
+              <span class="setting-desc">Adapta qualidade baseada na rede e viewers</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="auto-bitrate-toggle">
+              <span class="slider round"></span>
+            </label>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-text">
+              <span class="setting-label"><i class="fa-solid fa-compress"></i> Resolução Dinâmica (DSR)</span>
+              <span class="setting-desc">Reduz a resolução automaticamente em redes lentas</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="dsr-toggle">
+              <span class="slider round"></span>
+            </label>
+          </div>
+          
+          <div class="setting-item clickable" id="quality-selector-btn">
+            <div class="setting-text">
+              <span class="setting-label"><i class="fa-solid fa-sliders"></i> Qualidade</span>
+              <span class="setting-desc" id="quality-desc">1080p 60fps (High)</span>
+            </div>
+            <i class="fa-solid fa-chevron-right chevron-icon"></i>
+          </div>
+
+          <div class="setting-item clickable" id="audio-output-btn">
+            <div class="setting-text">
+              <span class="setting-label"><i class="fa-solid fa-headphones"></i> Saída de Áudio</span>
+              <span class="setting-desc" id="audio-desc">Padrão do Sistema</span>
+            </div>
+            <i class="fa-solid fa-chevron-right chevron-icon"></i>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Quality Presets Modal -->
+      <div class="settings-modal quality-modal hidden glass-panel" id="quality-modal">
+        <div class="settings-header">
+          <h3>Predefinições de Qualidade</h3>
+        </div>
+        <div class="settings-body list-menu">
+          <div class="menu-item">
+            <div class="menu-icon"><i class="fa-solid fa-bolt"></i></div>
+            <div class="menu-text">
+              <span class="menu-title">FONTE (Nativa)</span>
+              <span class="menu-desc">1920x1080 180fps · 15Mbps</span>
+            </div>
+          </div>
+          <div class="menu-item">
+            <div class="menu-icon"><i class="fa-solid fa-align-left"></i></div>
+            <div class="menu-text">
+              <span class="menu-title">Trabalho / Texto</span>
+              <span class="menu-desc">1920x1080 30fps · 2.5Mbps</span>
+            </div>
+          </div>
+          <div class="menu-item">
+            <div class="menu-icon"><i class="fa-solid fa-film"></i></div>
+            <div class="menu-text">
+              <span class="menu-title">Filmes / Séries</span>
+              <span class="menu-desc">1920x1080 60fps · 5Mbps</span>
+            </div>
+          </div>
+          <div class="menu-item selected">
+            <div class="menu-icon"><i class="fa-solid fa-gamepad"></i></div>
+            <div class="menu-text">
+              <span class="menu-title">Gaming 720p</span>
+              <span class="menu-desc">1280x720 60fps · 4Mbps</span>
+            </div>
+          </div>
+          <div class="menu-item">
+            <div class="menu-icon"><i class="fa-solid fa-gamepad"></i></div>
+            <div class="menu-text">
+              <span class="menu-title">Gaming 1080p</span>
+              <span class="menu-desc">1920x1080 60fps · 8Mbps</span>
+            </div>
+          </div>
+
+          <div class="custom-section">
+            <h4 class="custom-header">PERSONALIZADA</h4>
+            <div class="custom-grid">
+              <div class="input-group">
+                <label>LARGURA</label>
+                <input type="number" id="custom-w" value="800" max="1920">
+              </div>
+              <div class="input-group">
+                <label>ALTURA</label>
+                <input type="number" id="custom-h" value="600" max="1080">
+              </div>
+              <div class="input-group">
+                <label>FPS</label>
+                <input type="number" id="custom-fps" value="30">
+              </div>
+              <div class="input-group">
+                <label>MBPS</label>
+                <input type="number" id="custom-bps" value="8">
+              </div>
+            </div>
+            
+            <label class="checkbox-container">
+              <input type="checkbox" id="gaming-mode-check">
+              <span class="checkmark"></span>
+              <span class="cb-label">Modo Game (Áudio RAW, Mantém FPS)</span>
+            </label>
+            
+            <button class="apply-custom-btn primary-button">
+              <i class="fa-solid fa-check"></i>
+              <div class="btn-text">
+                <span class="btn-title">Aplicar Custom</span>
+                <span class="btn-desc">800x600 30fps · 8Mbps</span>
+              </div>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Window Picker Modal -->
+      <div class="settings-modal picker-modal hidden glass-panel" id="picker-modal">
+        <div class="settings-header">
+          <h3>O que você deseja compartilhar?</h3>
+          <button class="close-btn clickable" id="close-picker-btn"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="picker-tabs">
+          <div class="picker-tab active" data-target="screens-grid">Telas</div>
+          <div class="picker-tab" data-target="windows-grid">Aplicativos</div>
+        </div>
+        <div class="settings-body scrollable-body">
+          <div id="screens-grid" class="picker-grid">
+            <!-- Populated by TS -->
+          </div>
+          <div id="windows-grid" class="picker-grid hidden">
+            <!-- Populated by TS -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom Control Bar -->
+      <footer class="control-bar glass-panel">
+        <div class="left-controls">
+          <div class="live-status">
+            <span class="status-dot"></span>
+            <span id="live-text">Pronto</span>
+          </div>
+          <div class="session-time">
+            <span class="time-label">Sessão</span>
+            <span class="time-value" id="session-timer">00:00</span>
+          </div>
+          <div class="volume-control">
+            <button class="icon-button minimal" id="mute-sys-audio-btn" title="Silenciar Sistema">
+              <i class="fa-solid fa-volume-high"></i>
+            </button>
+            <input type="range" class="volume-slider" id="volume-slider" min="0" max="100" value="100">
+          </div>
+        </div>
+
+        <div class="center-controls">
+          <button class="action-button circle-btn" id="mic-toggle-btn" title="Silenciar Microfone">
+            <i class="fa-solid fa-microphone"></i>
+          </button>
+          <button class="action-button circle-btn primary-action" id="screen-share-btn" title="Compartilhar Tela">
+            <i class="fa-solid fa-desktop"></i>
+          </button>
+        </div>
+
+        <div class="right-controls">
+          <button class="icon-button outline warn" id="debug-restart-btn" title="Forçar Reinício">
+            <i class="fa-solid fa-rotate-right"></i>
+          </button>
+          <button class="icon-button outline" id="footer-settings-btn" title="Opções Avançadas">
+            <i class="fa-solid fa-sliders"></i>
+          </button>
+          <button class="icon-button outline" id="fullscreen-btn" title="Tela Cheia">
+            <i class="fa-solid fa-expand"></i>
+          </button>
+        </div>
+      </footer>
+    </div>
+  </body>
+</html>

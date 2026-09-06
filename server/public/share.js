@@ -54,6 +54,8 @@ const opcoes = {
   // A URL vence o que está guardado: ela carrega a intenção desta abertura.
   bitrate: Number(query.get('q')) || Number(salvas.bitrate) || 2_500_000,
   fps: Number(query.get('fps')) || Number(salvas.fps) || 30,
+  autoBitrate: query.get('auto') !== null ? query.get('auto') === 'true' : (salvas.autoBitrate !== undefined ? salvas.autoBitrate : true),
+  dsrEnabled: query.get('dsr') !== null ? query.get('dsr') === 'true' : (salvas.dsrEnabled !== undefined ? salvas.dsrEnabled : false),
 };
 
 function guardar() {
@@ -67,12 +69,15 @@ function guardar() {
 function espelharOpcoes() {
   $('qualidade').value = String(opcoes.bitrate);
   $('quadros').value = String(opcoes.fps);
+  $('autoBitrate').checked = opcoes.autoBitrate;
+  $('dsrEnabled').checked = opcoes.dsrEnabled;
 }
 
 function aplicarOpcoes(novas) {
   if (!novas) return;
   if (Number(novas.q)) opcoes.bitrate = Number(novas.q);
   if (Number(novas.fps)) opcoes.fps = Number(novas.fps);
+  if (novas.auto !== undefined) opcoes.autoBitrate = Boolean(novas.auto);
   // Os selects seguem o valor efetivo: mostrar 5 Mbps enquanto se transmite a
   // 1 Mbps é pior do que não mostrar nada.
   espelharOpcoes();
@@ -86,8 +91,12 @@ function aplicarOpcoes(novas) {
  * a próxima.
  */
 function mudarOpcao(chave, valor) {
-  if (!Number(valor)) return;
-  opcoes[chave] = Number(valor);
+  if (chave === 'autoBitrate') {
+    opcoes[chave] = Boolean(valor);
+  } else {
+    if (!Number(valor)) return;
+    opcoes[chave] = Number(valor);
+  }
   guardar();
   for (const painel of Object.values(paineis)) painel?.aplicarQualidade?.();
 }
@@ -418,6 +427,8 @@ function criarPainel(fonte) {
       wsUrl: `${proto}://${location.host}/ws?t=${encodeURIComponent(token)}&fonte=${fonte}`,
       bitrate: opcoes.bitrate,
       fps: opcoes.fps,
+      autoBitrate: opcoes.autoBitrate,
+      dsrEnabled: opcoes.dsrEnabled,
       audio: !camera,
       fonte,
       // A prévia já pagou o gesto do usuário e a permissão: reaproveitá-la é o
@@ -432,7 +443,13 @@ function criarPainel(fonte) {
       onStats: (s) => {
         el('viewers').textContent = s.viewers;
         el('fps').textContent = `${s.fps} fps`;
-        el('bitrate').textContent = `${s.mbps.toFixed(1)} Mb/s`;
+        
+        let bitStr = `${s.mbps.toFixed(1)} Mb/s`;
+        if (s.effectiveBitrate && s.baseBitrate && s.effectiveBitrate < s.baseBitrate) {
+          bitStr += ` (Auto: ${(s.effectiveBitrate / 1_000_000).toFixed(1)})`;
+        }
+        el('bitrate').textContent = bitStr;
+        
         el('elapsed').textContent =
           `${String(Math.floor(s.seconds / 60)).padStart(2, '0')}:${String(s.seconds % 60).padStart(2, '0')}`;
       },
@@ -509,7 +526,7 @@ function criarPainel(fonte) {
     verCamera,
     setStatus,
     indisponivel: () => Boolean(indisponivel),
-    aplicarQualidade: () => broadcaster?.setQuality({ bitrate: opcoes.bitrate, fps: opcoes.fps }),
+    aplicarQualidade: () => broadcaster?.setQuality({ bitrate: opcoes.bitrate, fps: opcoes.fps, autoBitrate: opcoes.autoBitrate, dsrEnabled: opcoes.dsrEnabled }),
     ativo: () => Boolean(broadcaster),
     // Fechar a aba tem que soltar a câmera, esteja ela no ar ou só na prévia.
     parar: () => {
@@ -562,6 +579,8 @@ $('somAba').addEventListener('click', async () => {
 espelharOpcoes();
 $('qualidade').addEventListener('change', (e) => mudarOpcao('bitrate', e.target.value));
 $('quadros').addEventListener('change', (e) => mudarOpcao('fps', e.target.value));
+$('autoBitrate').addEventListener('change', (e) => mudarOpcao('autoBitrate', e.target.checked));
+$('dsrEnabled').addEventListener('change', (e) => mudarOpcao('dsrEnabled', e.target.checked));
 
 window.addEventListener('beforeunload', () => {
   for (const f of FONTES) paineis[f]?.parar();

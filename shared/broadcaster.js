@@ -83,7 +83,8 @@ function candidatos(width, height, fps) {
     const codec = `avc1.${perfil}${nivel}`;
     return [{ codec, avc: { format: 'annexb' } }, { codec }];
   });
-  return [...h264, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }];
+  // Priorizando VP8 pois o H.264 do Discord Activity falha ao decodificar (tela infinita)
+  return [{ codec: 'vp8' }, ...h264, { codec: 'vp09.00.10.08' }];
 }
 
 /**
@@ -130,8 +131,12 @@ const MAX_H = 1080;
 
 const even = (n) => Math.max(2, n - (n % 2));
 
-function fitWithin(w, h) {
-  const scale = Math.min(1, MAX_W / w, MAX_H / h);
+function fitWithin(w, h, targetW = 1920, targetH = 1080) {
+  // Cap the user's requested target by our global constants
+  const safeTargetW = Math.min(targetW, MAX_W);
+  const safeTargetH = Math.min(targetH, MAX_H);
+
+  const scale = Math.min(1, safeTargetW / w, safeTargetH / h);
   return { width: even(Math.round(w * scale)), height: even(Math.round(h * scale)) };
 }
 
@@ -233,6 +238,8 @@ export function createBroadcaster({
   apiBase = '',
   bitrate,
   fps,
+  maxWidth = 1920,
+  maxHeight = 1080,
   audio = false,
   fonte = 'tela',
   // Stream já aberto pela prévia. Reaproveitá-lo é o que evita abrir o seletor
@@ -240,6 +247,8 @@ export function createBroadcaster({
   streamPronto = null,
   // Qual câmera, quando há mais de uma. Ignorado pela tela, que não tem lista.
   deviceId = null,
+  autoBitrate = false, // Opção extra do DBA
+  dsrEnabled = false,  // Dynamic Super Resolution
   onStatus,
   onStats,
   onEnd,
@@ -290,6 +299,13 @@ export function createBroadcaster({
   let viewers = 0;
   let statsTimer = null;
 
+  // DBA (Dynamic Bitrate Allocation) State
+  let baseBitrate = bitrate;
+  let currentBitrate = bitrate;
+  let consecutiveCongestion = 0;
+  let consecutiveClean = 0;
+  let currentDsrScale = 1.0;
+
   async function start() {
     // Precisa vir do gesto do usuário; qualquer await antes disso o invalida.
     // A prévia já pagou esse preço, então quando ela existe não há o que pedir.
@@ -308,7 +324,12 @@ export function createBroadcaster({
     );
 
     const s = track.getSettings();
-    const target = fitWithin(s.width ?? 1280, s.height ?? 720);
+    const target = fitWithin(
+      s.width || maxWidth,
+      s.height || maxHeight,
+      maxWidth,
+      maxHeight
+    );
 
     config = await pickConfig(target.width, target.height);
     if (!config) {
@@ -341,6 +362,60 @@ export function createBroadcaster({
     });
 
     statsTimer = setInterval(() => {
+      // --- Inteligência de Bitrate (DBA) ---
+      const activeUploads = peers.size + (enviarChunks ? 1 : 0);
+      let nextBitrate = currentBitrate;
+
+      if (autoBitrate) {
+        const isCongested = (ws?.bufferedAmount ?? 0) > 250_000;
+
+        if (isCongested) {
+          consecutiveCongestion++;
+          consecutiveClean = 0;
+        } else {
+          consecutiveClean++;
+          consecutiveCongestion = 0;
+        }
+
+        const maxAllowedBitrate = Math.floor(baseBitrate / Math.max(1, Math.sqrt(activeUploads)));
+
+        if (consecutiveCongestion > 0) {
+          // Reduz rápido sob lentidão real
+          nextBitrate = Math.max(100_000, nextBitrate * 0.8);
+          if (dsrEnabled && consecutiveCongestion > 3) {
+            currentDsrScale = Math.max(0.5, currentDsrScale - 0.1);
+          }
+        } else if (consecutiveClean > 2 && nextBitrate < maxAllowedBitrate) {
+          // Aumenta lentamente se estiver livre
+          nextBitrate = Math.min(maxAllowedBitrate, nextBitrate * 1.05);
+          if (dsrEnabled && consecutiveClean > 5) {
+            currentDsrScale = Math.min(1.0, currentDsrScale + 0.1);
+          }
+        } else if (nextBitrate > maxAllowedBitrate) {
+          // Reduz de imediato se o teto (por número de pessoas) baixou muito
+          nextBitrate = maxAllowedBitrate;
+        }
+      } else {
+        // Sem DBA, retorna o target original
+        nextBitrate = baseBitrate;
+        currentDsrScale = 1.0;
+      }
+
+      // Histerese para evitar reconfigurações à toa (flutuações menores que 50 kbps ignoradas)
+      if (Math.abs(nextBitrate - currentBitrate) > 50_000) {
+        currentBitrate = nextBitrate;
+
+        if (encoder?.state === 'configured') {
+          config = { ...config, bitrate: currentBitrate };
+          try { encoder.configure(config); } catch (e) { console.warn('[DBA]', e.message); }
+        }
+
+        for (const pc of peers.values()) {
+          ajustarEnvio(pc, { bitrate: currentBitrate, fonte, fps }).catch(() => { });
+        }
+      }
+      // -------------------------------------
+
       onStats?.({
         viewers,
         fps: frames,
@@ -350,6 +425,8 @@ export function createBroadcaster({
         fpsEntrada: framesEntrada,
         mbps: (bytes * 8) / 1e6,
         seconds: Math.floor((Date.now() - startedAt) / 1000),
+        effectiveBitrate: currentBitrate,
+        baseBitrate: baseBitrate
       });
       bytes = 0;
       frames = 0;
@@ -481,6 +558,9 @@ export function createBroadcaster({
 
   /** A superfície escolhida entrega som sem levar o Discord junto? */
   function somIsolado(superficie) {
+    const isElectron = typeof navigator !== 'undefined' && navigator?.userAgent?.toLowerCase()?.includes('electron');
+    if (isElectron) return true;
+
     if (superficie === 'browser') return true;
     return superficie === 'window' && somDeJanelaConfiavel();
   }
@@ -552,7 +632,7 @@ export function createBroadcaster({
 
     // Encerra o laço anterior antes de abrir outro, senão os dois alimentam o
     // mesmo encoder e a fila estoura.
-    await audioReader?.cancel().catch(() => {});
+    await audioReader?.cancel().catch(() => { });
     audioReader = null;
     if (audioEncoder?.state === 'configured') {
       try {
@@ -717,7 +797,7 @@ export function createBroadcaster({
       opacity: '0',
     });
     document.body.append(video);
-    video.play().catch(() => {});
+    video.play().catch(() => { });
 
     const t0 = performance.now();
     const hasRvfc = typeof video.requestVideoFrameCallback === 'function';
@@ -734,7 +814,7 @@ export function createBroadcaster({
       if (!running) return;
       // Alguns navegadores pausam ao trocar de aba; sem isso o loop morre em
       // silêncio e a transmissão congela sem erro nenhum.
-      if (video.paused) video.play().catch(() => {});
+      if (video.paused) video.play().catch(() => { });
       if (video.readyState < 2 || !video.videoWidth) return schedule();
 
       const now = performance.now();
@@ -818,25 +898,17 @@ export function createBroadcaster({
     }
 
     proximaMarca += passo;
-    // A origem entrega mais devagar que o alvo: a grade não tem por que correr
-    // atrás de marcas que já passaram e que nenhum quadro vai preencher.
+    // A origem entrega mais devagar que o alvo: a grade no tem por que correr
+    // atrs de marcas que j passaram e que nenhum quadro vai preencher.
     if (proximaMarca < tsMs) proximaMarca = tsMs + passo;
 
-    const timestamp = frame.timestamp ?? performance.now() * 1000;
     syncSize(frame);
 
     const now = Date.now();
     if (now - lastKeyframeAt > KEYFRAME_EVERY_MS) wantKeyframe = true;
 
-    let out = frame;
-    if (stage) {
-      stageCtx.drawImage(frame, 0, 0, stage.width, stage.height);
-      frame.close();
-      out = new VideoFrame(stage, { timestamp });
-    }
-
     try {
-      encoder.encode(out, { keyFrame: wantKeyframe });
+      encoder.encode(frame, { keyFrame: wantKeyframe });
       if (wantKeyframe) {
         lastKeyframeAt = now;
         wantKeyframe = false;
@@ -845,15 +917,15 @@ export function createBroadcaster({
       console.error('[encode]', err);
     }
 
-    out.close();
+    frame.close();
     frames++;
     return true;
   }
 
   /**
-   * Mantém o encoder casado com o tamanho real da fonte.
+   * Mantm o encoder casado com o tamanho real da fonte.
    *
-   * displayWidth/Height e não codedWidth/Height: o codificado inclui padding de
+   * displayWidth/Height e no codedWidth/Height: o codificado inclui padding de
    * alinhamento do codec, e configurar o encoder por ele faz recortar as bordas.
    */
   function syncSize(frame) {
@@ -863,13 +935,17 @@ export function createBroadcaster({
 
     srcW = sw;
     srcH = sh;
-    const target = fitWithin(sw, sh);
+    const baseTarget = fitWithin(sw, sh, maxWidth, maxHeight);
+    const target = {
+      width: even(Math.round(baseTarget.width * currentDsrScale)),
+      height: even(Math.round(baseTarget.height * currentDsrScale)),
+    };
 
     if (target.width !== config.width || target.height !== config.height) {
-      // O nível acompanha o tamanho. Uma janela de 720p que vira 1080p no meio
-      // da transmissão passa a precisar de um nível acima, e reconfigurar com o
-      // antigo é pedir um quadro que não cabe no contrato — exatamente o erro
-      // que fazia a tela cair para VP8, agora com a transmissão no ar.
+      // O nvel acompanha o tamanho. Uma janela de 720p que vira 1080p no meio
+      // da transmisso passa a precisar de um nvel acima, e reconfigurar com o
+      // antigo  pedir um quadro que no cabe no contrato  exatamente o erro
+      // que fazia a tela cair para VP8, agora com a transmisso no ar.
       const anterior = config;
       config = {
         ...config,
@@ -880,8 +956,8 @@ export function createBroadcaster({
       try {
         encoder.configure(config);
       } catch (err) {
-        // Nível novo recusado: seguir com o tamanho velho entrega imagem
-        // esticada, mas entrega. Parar aqui não entregaria nada.
+        // Nvel novo recusado: seguir com o tamanho velho entrega imagem
+        // esticada, mas entrega. Parar aqui no entregaria nada.
         console.warn('[encoder] nivel recusado, mantendo a configuracao anterior:', err.message);
         config = anterior;
         return;
@@ -893,17 +969,6 @@ export function createBroadcaster({
         height: config.height,
         direct: Boolean(window.MediaStreamTrackProcessor),
       });
-    }
-
-    // fitWithin preserva a proporção, então reduzir não corta nada.
-    if (target.width === sw && target.height === sh) {
-      stage = null;
-      stageCtx = null;
-    } else {
-      stage = document.createElement('canvas');
-      stage.width = target.width;
-      stage.height = target.height;
-      stageCtx = stage.getContext('2d', { alpha: false, desynchronized: true });
     }
   }
 
@@ -1138,7 +1203,7 @@ export function createBroadcaster({
     // Encerra o loop anterior antes de abrir outro, senão os dois disputam o
     // encoder e a fila estoura.
     reader = null;
-    await previousReader?.cancel().catch(() => {});
+    await previousReader?.cancel().catch(() => { });
     previous?.getTracks().forEach((t) => t.stop());
 
     // Zera o tamanho conhecido: a tela nova quase certamente tem outro, e é o
@@ -1153,13 +1218,13 @@ export function createBroadcaster({
 
     if (video) {
       video.srcObject = fresh;
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     } else {
       pumpDirect(track);
     }
 
     // A tela nova traz a própria faixa de som; a antiga morreu com o stream.
-    await audioReader?.cancel().catch(() => {});
+    await audioReader?.cancel().catch(() => { });
     audioReader = null;
     const novoAudio = prepararSom(track, fresh);
     if (novoAudio && audioEncoder) pumpAudio(novoAudio);
@@ -1171,8 +1236,20 @@ export function createBroadcaster({
   }
 
   /** Ajusta qualidade e taxa de quadros com a transmissão no ar. */
-  function setQuality({ bitrate: nextBitrate, fps: nextFps } = {}) {
-    if (nextBitrate) bitrate = nextBitrate;
+  function setQuality({ bitrate: nextBitrate, fps: nextFps, maxWidth: nextW, maxHeight: nextH, autoBitrate: nextAutoBitrate, dsrEnabled: nextDsrEnabled } = {}) {
+    if (nextAutoBitrate !== undefined) autoBitrate = nextAutoBitrate;
+    if (nextDsrEnabled !== undefined) dsrEnabled = nextDsrEnabled;
+    if (nextBitrate) {
+      baseBitrate = nextBitrate;
+      currentBitrate = nextBitrate;
+      consecutiveClean = 0;
+      consecutiveCongestion = 0;
+      // Recalcula o bitrate real na próxima passada do statsTimer.
+      bitrate = nextBitrate;
+    }
+    if (nextW) maxWidth = nextW;
+    if (nextH) maxHeight = nextH;
+
     // Taxa nova, grade nova: o freio do encodeFrame mede contra a taxa atual, e
     // subir de 15 para 60 fps precisa valer já no próximo quadro.
     if (nextFps && nextFps !== fps) {
@@ -1191,7 +1268,7 @@ export function createBroadcaster({
     stream
       ?.getVideoTracks()[0]
       ?.applyConstraints({ frameRate: { ideal: fps, max: fps } })
-      .catch(() => {});
+      .catch(() => { });
 
     // O mesmo teto vale para as conexões diretas: sem ele o WebRTC parte de um
     // chute conservador e leva dezenas de segundos subindo até a qualidade
@@ -1218,9 +1295,9 @@ export function createBroadcaster({
     clearInterval(statsTimer);
     statsTimer = null;
 
-    reader?.cancel().catch(() => {});
+    reader?.cancel().catch(() => { });
     reader = null;
-    audioReader?.cancel().catch(() => {});
+    audioReader?.cancel().catch(() => { });
     audioReader = null;
 
     for (const e of [encoder, audioEncoder]) {
@@ -1236,7 +1313,7 @@ export function createBroadcaster({
     audioEncoder = null;
 
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'stop' }));
+      ws.send(JSON.stringify({ type: 'stop', reason: typeof reason === 'string' ? reason : 'Desconhecido' }));
       ws.close();
     }
     ws = null;

@@ -11,9 +11,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.useFakeTimers();
 const R = await import('./rooms.js');
 
-const SWEEP = 4 * 1000;
-const CARENCIA = 12 * 1000;
-const SEM_PRESENCA = 15 * 1000;
+const SWEEP = 2 * 1000;
+const CARENCIA = 30 * 1000;
+const SEM_PRESENCA = 10 * 1000;
 
 let sequencia = 0;
 const instancia = () => `faxina-${++sequencia}`;

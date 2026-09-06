@@ -30,25 +30,22 @@ let proximoPeerId = 1;
 export const FONTES = new Set(['tela', 'camera']);
 // Sala é objeto em memória criado por qualquer pessoa autenticada: sem teto,
 // um laço de "criar sala" consome a RAM do processo.
-const MAX_ROOMS_PER_INSTANCE = 20;
-const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+const MAX_ROOMS_PER_INSTANCE = 5;
+const MAX_BUFFERED_BYTES = 512 * 1024;
 
 // Intervalo mínimo entre dois pedidos de keyframe para a mesma transmissão.
-const KEYFRAME_ASK_EVERY_MS = 1000;
+const KEYFRAME_ASK_EVERY_MS = 3000;
 const MAX_NAME = 32;
 const MAX_ROOM_NAME = 40;
 
 // Sala vazia fecha, mas não no mesmo instante: recarregar a atividade
 // desconecta e reconecta, e quem estivesse sozinho perderia a sala a cada F5.
-// 12s cobre um reload com folga e some rápido o bastante para não deixar sala
-// fantasma na lista.
-const EMPTY_GRACE_MS = 12 * 1000;
+// 30s cobre um reload normal e atrasos no handshake do Discord SDK, mas some rápido o bastante.
+const EMPTY_GRACE_MS = 30 * 1000;
 // Quanto tempo a transmissão de alguém sobrevive à saída dessa pessoa da sala.
-// Existe pelo mesmo motivo da carência acima: recarregar a atividade desconecta
-// e reconecta, e sem ela um F5 derrubaria a transmissão de quem não saiu de
-// lugar nenhum.
-const SEM_PRESENCA_MS = 15 * 1000;
-const SWEEP_EVERY_MS = 4 * 1000;
+// 10s libera os buffers das pessoas que abandonaram a atividade.
+const SEM_PRESENCA_MS = 10 * 1000;
+const SWEEP_EVERY_MS = 2 * 1000;
 
 // Freio de força bruta: sem isso uma senha curta cai em segundos, porque o
 // endpoint responde tão rápido quanto a rede permite.
@@ -323,6 +320,13 @@ export function ensureCallRoom(instance, id, metadata = {}) {
     room.guildId = metadata.guildId ?? room.guildId ?? null;
     room.guildName = metadata.guildName ?? room.guildName ?? null;
     room.channelId = metadata.channelId ?? room.channelId ?? null;
+
+    // Alguém acabou de pedir a sala para entrar (via API). Renovamos a carência
+    // para a sala não ser varrida pelo sweeper antes do WebSocket conectar.
+    if (room.viewers.size === 0 && room.broadcasters.size === 0) {
+      room.emptySince = Date.now();
+    }
+
     return room;
   }
 
@@ -445,7 +449,7 @@ const sweeper = setInterval(() => {
       // e como não há `close`, a aba nem tenta reconectar.
       for (const ws of room.controles) {
         sendJson(ws, { type: 'room-gone' });
-        ws.close();
+        setTimeout(() => ws.close(), 500);
       }
       room.controles.clear();
 
@@ -548,6 +552,7 @@ export function broadcastState(room) {
   const msg = JSON.stringify(roomState(room));
   for (const v of room.viewers) send(v, msg);
   for (const e of room.broadcasters.values()) send(e.ws, msg);
+  for (const c of room.controles) send(c, msg);
 }
 
 /**
@@ -693,6 +698,7 @@ export function pushChunk(room, entry, chunk) {
   recordTraffic(room.traffic, 'receivedBytes', bytes);
   recordTraffic(entry.traffic, 'receivedBytes', bytes);
 
+  if (bytes < 2) return;
   if (chunk[SLOT_BYTE] !== entry.slot) return;
 
   const tipo = chunk[TYPE_BYTE];
@@ -832,6 +838,13 @@ export function unwatch(room, ws, slot) {
   ws.__primed.delete(slot);
   encerrarPeer(room, ws, slot);
   broadcastState(room);
+}
+
+export function requestKeyframeViewer(room, ws, slot) {
+  const entry = room.slots.get(slot);
+  if (!entry || !entry.streaming) return;
+  if (!ws.__watching.has(slot)) return;
+  requestKeyframe(entry);
 }
 
 // ------------------------------------------------------------------- WebRTC

@@ -21,5 +21,6 @@ client/dist
 docs
 infra
 squarecloud.app
+desktop-app
 *.png
 *.log

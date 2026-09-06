@@ -33,7 +33,7 @@ export default defineConfig([
   },
 
   {
-    files: ['server/**/*.js', 'scripts/**/*.mjs', 'client/vite.config.js', 'vitest.*.js'],
+    files: ['server/**/*.js', 'scripts/**/*.mjs', 'client/vite.config.js', 'vitest.*.js', 'desktop-app/**/*.js'],
     ignores: ['server/public/**'],
     languageOptions: { globals: globals.node },
   },
