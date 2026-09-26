@@ -34,6 +34,7 @@
         <div class="lobby-actions">
           <button id="lobbyUser" class="user-chip" title="Seu perfil" hidden></button>
           <button id="loginBtn" class="btn" hidden>Entrar com Discord</button>
+          <button id="downloadBtn" class="btn" hidden>Baixar Desktop App</button>
           <button id="newRoom" class="btn go">Criar sala</button>
         </div>
       </header>
@@ -152,9 +153,39 @@
               <path d="M18 13.5V19a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H11" />
             </svg>
           </button>
-          <button id="fsrToggle" class="btn" data-tip="FSR / Nitidez" aria-label="FSR Upscaling" hidden>
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 2L15 8H9L12 2Z M2 22L8 18V22H2Z M22 22V18L16 22H22Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <div id="fsrBox" class="volume" hidden>
+            <button id="fsrToggle" class="btn" data-tip="Opções de Vídeo" aria-label="Opções de Vídeo">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 2L15 8H9L12 2Z M2 22L8 18V22H2Z M22 22V18L16 22H22Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <div class="fsr-pop">
+              <div class="fsr-row" style="flex-direction: row; justify-content: space-between;">
+                <label for="showPingsSwitch" style="cursor: pointer;">Mostrar Pings (Laser)</label>
+                <input type="checkbox" id="showPingsSwitch" style="cursor: pointer;" checked />
+              </div>
+              <div class="fsr-row" style="flex-direction: row; justify-content: space-between;">
+                <label for="allowZoomSwitch" style="cursor: pointer;">Permitir Zoom (Roda do Mouse)</label>
+                <input type="checkbox" id="allowZoomSwitch" style="cursor: pointer;" />
+              </div>
+              <div class="fsr-row" style="flex-direction: row; justify-content: space-between;">
+                <label for="fsrSwitch" style="cursor: pointer;">Ativar Filtros</label>
+                <input type="checkbox" id="fsrSwitch" style="cursor: pointer;" />
+              </div>
+              <div class="fsr-row">
+                <label for="fsrStrength">Nitidez: <span id="fsrStrengthVal">1.5</span></label>
+                <input id="fsrStrength" type="range" min="0.0" max="3.0" step="0.1" value="1.5" aria-label="Força da Nitidez" />
+              </div>
+              <div class="fsr-row">
+                <label for="fsrSaturation">Saturação: <span id="fsrSaturationVal">1.0</span></label>
+                <input id="fsrSaturation" type="range" min="0.0" max="3.0" step="0.1" value="1.0" aria-label="Saturação" />
+              </div>
+            </div>
+          </div>
+          <button id="pipBtn" class="btn" data-tip="Janela Flutuante (PiP)" aria-label="Janela Flutuante (PiP)" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              <rect x="11" y="11" width="8" height="8" rx="1" ry="1"></rect>
             </svg>
           </button>
           <button id="fullscreen" class="btn" data-tip="Tela cheia" aria-label="Tela cheia" hidden>

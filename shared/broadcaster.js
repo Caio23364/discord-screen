@@ -77,14 +77,18 @@ function comNivel(codec, nivel) {
  * saída para quem não tem H.264 nenhum. `annexb` vem antes de cada perfil
  * porque dispensa o blob `description`, e o avcC é aceito onde annexb não é.
  */
-function candidatos(width, height, fps) {
+function candidatos(width, height, fps, requireVp8) {
   const nivel = nivelH264(width, height, fps).toString(16).padStart(2, '0');
   const h264 = PERFIS_H264.flatMap((perfil) => {
     const codec = `avc1.${perfil}${nivel}`;
     return [{ codec, avc: { format: 'annexb' } }, { codec }];
   });
-  // Priorizando VP8 pois o H.264 do Discord Activity falha ao decodificar (tela infinita)
-  return [{ codec: 'vp8' }, ...h264, { codec: 'vp09.00.10.08' }];
+  if (requireVp8) {
+    return [{ codec: 'vp8' }, ...h264, { codec: 'vp09.00.10.08' }];
+  } else {
+    // Prioritize H.264 if we don't strictly need VP8
+    return [...h264, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }];
+  }
 }
 
 /**
@@ -171,8 +175,9 @@ export function restricoesDeSom() {
  * que é o que destrava transmitir um jogo com o som dele.
  */
 export function opcoesTela({ fps = 30, comSom = false, video } = {}) {
+  const maxFps = Math.min(fps, 60);
   const opts = {
-    video: video ?? { frameRate: { ideal: fps, max: fps } },
+    video: video ?? { frameRate: { ideal: maxFps, max: maxFps } },
     audio: comSom ? restricoesDeSom() : false,
   };
   if (comSom) {
@@ -237,7 +242,7 @@ export function createBroadcaster({
   // que vem a lista de servidores ICE.
   apiBase = '',
   bitrate,
-  fps,
+  fps: initialFps,
   maxWidth = 1920,
   maxHeight = 1080,
   audio = false,
@@ -249,6 +254,7 @@ export function createBroadcaster({
   deviceId = null,
   autoBitrate = false, // Opção extra do DBA
   dsrEnabled = false,  // Dynamic Super Resolution
+  nativeVideoSource = false, // Modo Nativo N-API (ignora WebCodecs)
   onStatus,
   onStats,
   onEnd,
@@ -265,8 +271,7 @@ export function createBroadcaster({
   let somBloqueado = false;
   let video = null;
   let config = null;
-  let stage = null;
-  let stageCtx = null;
+  let censored = false;
 
   // Uma conexão direta por espectador. O servidor nomeia cada um; aqui o nome
   // é só a chave — quem é a pessoa não interessa para negociar transporte.
@@ -280,6 +285,7 @@ export function createBroadcaster({
 
   let running = false;
   let mySlot = 0;
+  let currentRequireVp8 = false;
   let wantKeyframe = true;
   let lastKeyframeAt = 0;
   let srcW = 0;
@@ -299,6 +305,11 @@ export function createBroadcaster({
   let viewers = 0;
   let statsTimer = null;
 
+  // Estado do FPS adaptável
+  let autoFps = initialFps === 'auto';
+  let fps = autoFps ? 60 : Math.min(initialFps, 60);
+  let baseFps = autoFps ? 60 : Math.min(initialFps, 60);
+
   // DBA (Dynamic Bitrate Allocation) State
   let baseBitrate = bitrate;
   let currentBitrate = bitrate;
@@ -312,38 +323,46 @@ export function createBroadcaster({
     stream = streamPronto ?? (fonte === 'camera' ? await capturarCamera() : await capturarTela());
 
     const track = stream.getVideoTracks()[0];
-    // Tela é texto e interface, onde suavizar borra o que importa. Câmera é
-    // vídeo natural, e aí suavizar é justamente o certo.
-    track.contentHint = fonte === 'camera' ? 'motion' : 'text';
-    track.addEventListener('ended', () =>
-      stop(
-        fonte === 'camera'
-          ? 'A câmera foi desligada.'
-          : 'Você parou o compartilhamento pelo navegador.',
-      ),
-    );
+    if (track) {
+      // Tela é texto e interface, onde suavizar borra o que importa. Câmera é
+      // vídeo natural, e aí suavizar é justamente o certo.
+      track.contentHint = fonte === 'camera' ? 'motion' : 'text';
+      track.addEventListener('ended', () =>
+        stop(
+          fonte === 'camera'
+            ? 'A câmera foi desligada.'
+            : 'Você parou o compartilhamento pelo navegador.',
+        ),
+      );
+    }
 
-    const s = track.getSettings();
-    const target = fitWithin(
-      s.width || maxWidth,
-      s.height || maxHeight,
-      maxWidth,
-      maxHeight
-    );
+    if (!nativeVideoSource) {
+      const s = track?.getSettings() || {};
+      const target = fitWithin(
+        s.width || maxWidth,
+        s.height || maxHeight,
+        maxWidth,
+        maxHeight
+      );
 
-    config = await pickConfig(target.width, target.height);
-    if (!config) {
-      cleanup();
-      throw new Error('Nenhum codec de vídeo suportado por este navegador.');
+      config = await pickConfig(target.width, target.height);
+      if (!config) {
+        cleanup();
+        throw new Error('Nenhum codec de vídeo suportado por este navegador.');
+      }
+    } else {
+      config = { codec: 'avc1.4d4028', width: maxWidth, height: maxHeight }; // Fallback para status
     }
 
     await connect();
 
-    encoder = new VideoEncoder({
-      output: onEncoded,
-      error: (err) => stop(`Erro no encoder: ${err.message}`),
-    });
-    encoder.configure(config);
+    if (!nativeVideoSource) {
+      encoder = new VideoEncoder({
+        output: onEncoded,
+        error: (err) => stop(`Erro no encoder: ${err.message}`),
+      });
+      encoder.configure(config);
+    }
 
     ws.send(JSON.stringify({ type: 'start' }));
 
@@ -358,7 +377,7 @@ export function createBroadcaster({
       codec: config.codec,
       width: config.width,
       height: config.height,
-      direct: Boolean(window.MediaStreamTrackProcessor),
+      direct: nativeVideoSource ? true : Boolean(window.MediaStreamTrackProcessor),
     });
 
     statsTimer = setInterval(() => {
@@ -367,7 +386,7 @@ export function createBroadcaster({
       let nextBitrate = currentBitrate;
 
       if (autoBitrate) {
-        const isCongested = (ws?.bufferedAmount ?? 0) > 250_000;
+        const isCongested = (ws?.bufferedAmount ?? 0) > 2_000_000;
 
         if (isCongested) {
           consecutiveCongestion++;
@@ -414,6 +433,22 @@ export function createBroadcaster({
           ajustarEnvio(pc, { bitrate: currentBitrate, fonte, fps }).catch(() => { });
         }
       }
+      
+      let nextFps = fps;
+      if (autoFps) {
+        const isCongested = (ws?.bufferedAmount ?? 0) > 2_000_000 || afogado;
+        if (isCongested) {
+          if (nextFps > 30) {
+            nextFps = 30; // Reduz instantaneamente para 30 fps
+          }
+        } else if (consecutiveClean > 5 && nextFps < baseFps) {
+          nextFps = 60; // Tenta recuperar após 5 segundos limpos
+        }
+      }
+
+      if (nextFps !== fps) {
+        setQuality({ fps: nextFps });
+      }
       // -------------------------------------
 
       onStats?.({
@@ -433,7 +468,10 @@ export function createBroadcaster({
       framesEntrada = 0;
     }, 1000);
 
-    pump(track);
+    if (!nativeVideoSource && track) {
+      pump(track);
+    }
+
     // Pedir áudio não garante receber: em vários sistemas a caixa "compartilhar
     // o som" fica desmarcada, e o navegador devolve a tela sem faixa de som.
     const audioTrack = prepararSom(track, stream);
@@ -702,7 +740,7 @@ export function createBroadcaster({
         break;
       }
 
-      if (audioEncoder?.state === 'configured') {
+      if (audioEncoder?.state === 'configured' && !censored) {
         try {
           audioEncoder.encode(dados);
         } catch (err) {
@@ -738,14 +776,20 @@ export function createBroadcaster({
     // `bitrateMode: 'constant'` ainda importa. O padrão é `variable`, e em VBR
     // o controlador de taxa trata o `bitrate` como média de longo prazo — numa
     // troca de cena ele estoura o alvo com folga, e a rajada é justamente o que
-    // entope o relay. Constante troca qualidade em cena difícil por um teto que
+    // entope the relay. Constante troca qualidade em cena difícil por um teto que
     // se cumpre.
-    for (const candidate of candidatos(width, height, fps)) {
+    for (const candidate of candidatos(width, height, fps, currentRequireVp8)) {
       for (const realtime of [true, false]) {
         for (const constante of [true, false]) {
           const cfg = { ...candidate, width, height, bitrate, framerate: fps };
           if (realtime) cfg.latencyMode = 'realtime';
           if (constante) cfg.bitrateMode = 'constant';
+          
+          // Se for H.264, exige aceleração por hardware. Se não tiver, falha e cai pro próximo (VP8).
+          if (cfg.codec.startsWith('avc1')) {
+            cfg.hardwareAcceleration = 'require-hardware';
+          }
+          
           try {
             const { supported } = await VideoEncoder.isConfigSupported(cfg);
             if (supported) return cfg;
@@ -839,6 +883,11 @@ export function createBroadcaster({
     if (!running || encoder?.state !== 'configured') {
       frame.close();
       return false;
+    }
+
+    if (censored) {
+      frame.close();
+      return true;
     }
 
     // Todo mundo que assiste está na conexão direta: este quadro não tem para
@@ -1013,12 +1062,13 @@ export function createBroadcaster({
 
   function serializeConfig(dc) {
     const out = { codec: dc.codec, codedWidth: dc.codedWidth, codedHeight: dc.codedHeight };
+    if (dc.avc || config?.avc) out.avc = dc.avc || config.avc;
     if (dc.description) {
-      const b = new Uint8Array(
-        dc.description instanceof ArrayBuffer ? dc.description : dc.description.buffer,
-      );
+      const b = dc.description instanceof ArrayBuffer
+        ? new Uint8Array(dc.description)
+        : new Uint8Array(dc.description.buffer, dc.description.byteOffset ?? 0, dc.description.byteLength);
       let bin = '';
-      for (const x of b) bin += String.fromCharCode(x);
+      for (let i = 0; i < b.byteLength; i++) bin += String.fromCharCode(b[i]);
       out.description = btoa(bin);
     }
     return out;
@@ -1052,6 +1102,15 @@ export function createBroadcaster({
         else if (msg.type === 'rtc-want') abrirPeer(msg.peer);
         else if (msg.type === 'rtc') receberRtc(msg.peer, msg.payload);
         else if (msg.type === 'rtc-bye') fecharPeer(msg.peer);
+        else if (msg.type === 'codec-preference') {
+          if (currentRequireVp8 !== msg.requireVp8) {
+            currentRequireVp8 = msg.requireVp8;
+            onAviso?.(`Qualidade ajustada automaticamente para manter a compatibilidade (${msg.requireVp8 ? 'VP8' : 'H.264'}).`);
+            if (encoder && running) {
+              reiniciarEncoder();
+            }
+          }
+        }
         // Ninguém mais depende do relay para esta transmissão (ou voltou a
         // depender). Ver a nota em encodeFrame.
         else if (msg.type === 'chunks') enviarChunks = msg.on !== false;
@@ -1079,6 +1138,48 @@ export function createBroadcaster({
   }
 
   // -------------------------------------------------------------------- parar
+
+  async function reiniciarEncoder() {
+    if (!encoder || !running || !stream) return;
+    
+    // Configura o próximo frame limpo para ancorar o novo stream
+    wantKeyframe = true;
+    
+    const track = stream.getVideoTracks()[0];
+    const s = track.getSettings();
+    const target = fitWithin(
+      s.width || maxWidth,
+      s.height || maxHeight,
+      maxWidth,
+      maxHeight
+    );
+    
+    try {
+      const novaConfig = await pickConfig(target.width, target.height);
+      if (novaConfig) {
+        config = novaConfig;
+        
+        // Destruímos o antigo antes de alocar um novo (GPU memory)
+        try { encoder.close(); } catch (e) {}
+        
+        encoder = new VideoEncoder({
+          output: onEncoded,
+          error: (err) => stop(`Erro no encoder: ${err.message}`),
+        });
+        
+        encoder.configure(config);
+        
+        onStatus?.({
+          codec: config.codec,
+          width: config.width,
+          height: config.height,
+          direct: Boolean(window.MediaStreamTrackProcessor),
+        });
+      }
+    } catch (e) {
+      console.warn("Falha ao reiniciar o encoder para troca de codec:", e);
+    }
+  }
 
   // ------------------------------------------------------------ ao vivo
 
@@ -1239,6 +1340,16 @@ export function createBroadcaster({
   function setQuality({ bitrate: nextBitrate, fps: nextFps, maxWidth: nextW, maxHeight: nextH, autoBitrate: nextAutoBitrate, dsrEnabled: nextDsrEnabled } = {}) {
     if (nextAutoBitrate !== undefined) autoBitrate = nextAutoBitrate;
     if (nextDsrEnabled !== undefined) dsrEnabled = nextDsrEnabled;
+    
+    if (nextFps === 'auto') {
+      autoFps = true;
+      nextFps = 60;
+      baseFps = 60;
+    } else if (nextFps) {
+      autoFps = false;
+      baseFps = nextFps;
+    }
+
     if (nextBitrate) {
       baseBitrate = nextBitrate;
       currentBitrate = nextBitrate;
@@ -1278,14 +1389,20 @@ export function createBroadcaster({
 
   const getSettings = () => ({ bitrate, fps });
 
+  function toggleCensor(active) {
+    if (censored === active) return;
+    censored = active;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'censor', on: censored }));
+    }
+  }
+
   function cleanup() {
     fecharPeers();
     stream?.getTracks().forEach((t) => t.stop());
     stream = null;
     video?.remove();
     video = null;
-    stage = null;
-    stageCtx = null;
   }
 
   function stop(reason) {
@@ -1322,13 +1439,56 @@ export function createBroadcaster({
     if (wasRunning) onEnd?.(reason ?? '');
   }
 
+  function injectNativeNalu(buffer) {
+    if (!running || !enviarChunks || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (censored) return;
+
+    // Buffer vindo do video_capture.cpp tem um cabeçalho de 24 bytes:
+    // [0..3] "GLVF" (Magic)
+    // [4..7] length (uint32)
+    // [8..11] flags (uint32) - bit 0 = keyframe
+    // [12..15] sequence (uint32)
+    // [16..17] width (uint16)
+    // [18..19] height (uint16)
+    // [20..23] timeMs (uint32)
+    // [24...] H.264 NALU (Annex B)
+    if (buffer.length < 24) return;
+    const view = new DataView(buffer.buffer || buffer, buffer.byteOffset, buffer.byteLength);
+    const magic = view.getUint32(0, true);
+    if (magic !== 0x46564C47) return; // 'GLVF'
+    
+    const flags = view.getUint32(8, true);
+    const isKeyframe = (flags & 1) !== 0;
+    
+    if (wantKeyframe && !isKeyframe) return;
+    wantKeyframe = false;
+    
+    const type = isKeyframe ? TIPO_KEYFRAME : TIPO_DELTA;
+    
+    // Calcula o tamanho real do frame e copia para envio
+    const payloadLength = buffer.length - 24;
+    const pacote = new Uint8Array(payloadLength + 2);
+    pacote[0] = mySlot;
+    pacote[1] = type;
+    pacote.set(new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + 24, payloadLength), 2);
+    
+    ws.send(pacote);
+    
+    bytes += payloadLength;
+    frames++;
+    framesEntrada++;
+  }
+
   return {
     start,
     stop,
+    injectNativeNalu,
     changeScreen,
     trocarSom,
     setQuality,
     getSettings,
+    toggleCensor,
+    peers,
     temSom: () => Boolean(audioEncoder),
     somBloqueado: () => somBloqueado,
     isRunning: () => running,

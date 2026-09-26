@@ -116,6 +116,11 @@ describe('baldes de tráfego', () => {
 
     R.pushChunk(room, entry, chunk);
     const primeiroSegundo = Math.floor(Date.now() / 1000);
+    
+    // Otimização: o tráfego do segundo atual não vai para o Map até que o segundo vire.
+    vi.advanceTimersByTime(1000);
+    R.pushChunk(room, entry, chunk);
+    
     expect(room.traffic.buckets.has(primeiroSegundo)).toBe(true);
 
     vi.advanceTimersByTime(90 * 1000);
@@ -123,6 +128,6 @@ describe('baldes de tráfego', () => {
 
     expect(room.traffic.buckets.has(primeiroSegundo)).toBe(false);
     // O acumulado não some junto: o que é podado é a série por segundo.
-    expect(room.traffic.receivedBytes).toBe(128);
+    expect(room.traffic.receivedBytes).toBe(192);
   });
 });

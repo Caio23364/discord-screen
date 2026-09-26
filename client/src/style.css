@@ -1397,3 +1397,74 @@ button {
   border-color: var(--danger);
   color: #ffb3b6;
 }
+.fsr-pop {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #111214;
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  z-index: 40;
+  width: max-content;
+}
+.fsr-pop::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 12px;
+}
+.volume:hover .fsr-pop,
+.volume:focus-within .fsr-pop {
+  display: flex;
+}
+.fsr-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fsr-row label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font: 600 11.5px/1 inherit;
+  color: var(--muted);
+}
+.fsr-row input[type="range"] {
+  width: 140px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------- Ping Laser */
+.ping-marker {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  background: var(--discord-blurple);
+  color: white;
+  border-radius: 50%;
+  transform: translate(-50%, -50%) scale(1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: bold;
+  pointer-events: none;
+  z-index: 100;
+  box-shadow: 0 0 10px rgba(0,0,0,0.5), 0 0 0 4px rgba(255,255,255,0.2);
+  transition: opacity 0.4s ease-out, transform 0.4s ease-out;
+  animation: ping-pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+@keyframes ping-pop {
+  0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+  100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+}

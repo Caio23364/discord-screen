@@ -31,6 +31,9 @@ O **discord-screen** é uma plataforma de compartilhamento de tela de ultra-baix
 * **Decodificação Quadro a Quadro:** Sem o atraso de 2 a 4 segundos típico de `MediaRecorder` ou containers HLS/DASH.
 * **Tamanho Leve e Sem Instalação Obrigatória para Espectadores:** Quem assiste só precisa estar no canal de voz do Discord e abrir a Activity.
 * **Resiliência de Rede Dupla:** Transmissão P2P WebRTC direta quando possível, com fallback instantâneo e invisível para WebSocket Relay caso haja bloqueio de NAT/firewall.
+* **Resiliência de Quadros (Adaptive FPS):** Redução automática e imperceptível do FPS e do Bitrate sob congestionamento de rede, e retomada dinâmica para 60 FPS quando o sinal é limpo.
+* **Qualidade Visual Configurável:** Renderizador WebGL customizado (estilo FSR) no cliente para aprimoramento adaptativo de nitidez e saturação das telas assistidas.
+* **Ferramentas Co-op & QoL:** Apontador Laser sincronizado (Pings), Modo Picture-in-Picture nativo, Zoom e Pan livre pelo lado do cliente, e botão de Privacidade/Censura imediata para o transmissor.
 
 ---
 
@@ -126,6 +129,9 @@ discord-screen/
 │   ├── smoke*.mjs              # Testes de fumaça ponta a ponta sem browser
 │   └── dev.mjs                 # Orquestrador de desenvolvimento local
 ├── docs/                       # Documentação legada e guias de infraestrutura
+├── tests/                      # Suítes de testes complexos (E2E)
+│   └── e2e/                    # Testes ponta a ponta com Playwright
+│       └── sandbox.spec.js     # Validação de interface mockando o iframe do Discord
 ├── eslint.config.js            # Configuração do ESLint Flat Config
 ├── vitest.config.js            # Configuração de testes automatizados com Vitest
 └── package.json                # Workspace raiz e scripts globais
@@ -140,12 +146,12 @@ discord-screen/
 #### [shared/broadcaster.js](file:///d:/discord-screen/shared/broadcaster.js)
 Este é o módulo central de transmissão, executado tanto na aba de captura (`/share.html`) quanto dentro do desktop app ou na própria Activity (quando o navegador permite).
 
-* **Seleção Dinâmica de Codecs:**
-  A função `candidatos(width, height, fps)` calcula o perfil e nível H.264 exato baseado na contagem de macroblocos por segundo (`nivelH264`), iterando entre perfis `High` (`6400`), `Main` (`4d40`) e `Baseline` (`42e0`), além de `annexb` vs `avcC`. Fornece fallback para `vp8` e `vp09`.
+* **Seleção Dinâmica de Codecs (Prioridade VP8):**
+  A função `candidatos(width, height, fps)` **prioriza sempre o codec `vp8`** como padrão, já que o Chromium embutido no Discord Activity frequentemente falha na decodificação de H.264 High Profile a 1080p (gerando "tela infinita" ao falhar em processar keyframes). O cálculo exato do perfil e nível H.264 baseado na contagem de macroblocos (`High`, `Main`, `Baseline`) e o VP09 são mantidos apenas como fallbacks secundários.
 * **Alinhamento de Ritmo e Grade de FPS (`proximaMarca`):**
   Evita micro-tremores na captura a 60 FPS. Se a origem entrega quadros com pequenas variações temporais (ex: 14ms e 18ms em vez de 16.6ms cravados), o broadcaster calcula o encaixe na grade temporal e descarta quadros redundantes sem descompassar o relógio.
 * **Controle de Congestionamento e Backpressure do Encoder:**
-  Se a fila interna do `VideoEncoder` ultrapassar 2 quadros, o broadcaster aciona o modo `afogado` e descarta quadros na entrada para impedir o acúmulo irreversível de latência.
+  Se a fila interna do `VideoEncoder` ultrapassar 2 quadros, o broadcaster aciona o modo `afogado` e descarta quadros na entrada para impedir o acúmulo irreversível de latência. O laço `statsTimer` observa esses engasgos e os buffers do WebSocket para realizar **Dynamic Bitrate Allocation (DBA)** e **Adaptive FPS**, reduzindo instantaneamente a qualidade para 30 FPS até a rede estabilizar, quando retoma para os originais 60 FPS.
 * **P2P Mesh Signaling:**
   Mantém um `Map<peerId, RTCPeerConnection>` indexado por espectadores. Quando um espectador solicita conexão direta, o broadcaster gera o SDP Offer, anexa as faixas locais (`stream.getTracks()`) e despacha a oferta via envelope de controle JSON pelo WebSocket.
 
@@ -166,10 +172,12 @@ Responsável por decodificar os quadros de vídeo brutos e renderizá-los com su
 * **Jitter Buffer Adaptativo (`BUFFER_MS = 80`):**
   TCP e internet pública entregam pacotes em rajadas. Desenhar um quadro assim que ele chega causa solavancos. O player enfileira os quadros e os reproduz rigorosamente 80ms após o instante em que foram capturados, restaurando a cadência nativa.
 * **Pipeline de Renderização Híbrido (WebGL2 + Fallback 2D):**
-  * **WebGL2:** Utiliza shaders customizados GLSL ES 3.0 com um algoritmo leve de contraste adaptativo / nitidez (estilo FSR / CAS), ajustável via uniform `u_sharpness`.
+  * **WebGL2:** Utiliza shaders customizados GLSL ES 3.0 com um algoritmo leve de contraste adaptativo / nitidez (estilo FSR / CAS), ajustável via uniform `u_sharpness`, além de saturação personalizada `u_saturation`.
   * **Fallback Canvas 2D:** Se o contexto WebGL2 falhar ou o navegador for incompatível, o player utiliza o contexto `2d` com `desynchronized: true`.
 * **Gerenciamento Estrito de Memória de GPU:**
   Cada quadro decodificado entrega uma instância de `VideoFrame`. É **obrigatório** chamar `frame.close()` imediatamente após `drawImage` ou `texImage2D`. Deixar de fechar um único `VideoFrame` vaza memória de vídeo e derruba a aba do navegador em poucos segundos.
+* **Reesincronização Invisível de Keyframes:**
+  Quando o decodificador falha ou trava, o jitter buffer despacha requisições periódicas (`need-keyframe`) limitadas a cada 2 segundos. O renderizador mantém o último quadro intacto (`preserveFrame: true`) em tela enquanto recupera o contexto silenciosamente, sem causar "tela preta".
 
 #### [client/src/audio.js](file:///d:/discord-screen/client/src/audio.js)
 Responsável pelo pipeline de áudio via Web Audio API.
@@ -182,7 +190,11 @@ Controlador geral da aplicação cliente.
 * **Integração com Discord SDK:** Inicializa o SDK, executa `sdk.commands.authorize()` com escopos `['identify', 'guilds']`, e envia o código para troca no servidor.
 * **Prefixagem de Rotas `/.proxy`:** Identifica se está rodando dentro do iframe do Discord (`inDiscord = params.has('frame_id')`) e prefixa todas as chamadas HTTP e conexões WS com `/.proxy`.
 * **Assistir é Opt-In:** Para poupar a banda de saída do servidor e o processamento do cliente, transmissões não solicitadas não recebem fluxo de bytes. O cliente envia mensagens `{ type: 'watch', slot }` e `{ type: 'unwatch', slot }`.
+* **Reconciliação de DOM sem Destruição (`patchChildren` + `tileCache`):**
+  A grade de participantes e a barra lateral nunca destroem nós existentes desnecessariamente. A função `patchChildren(container, newNodes)` compara os `childNodes` atuais com os desejados, removendo apenas nós ausentes e inserindo/reordenando os demais via `insertBefore`. Os tiles são cacheados em `tileCache` (Map indexado por `${userId}-${slot}-${palco}-${semVideo}`), que compara um snapshot JSON do estado visível (`stateStr`) e retorna o mesmo `HTMLElement` se nada mudou — evitando reconstrução de canvas, vídeos e decoders WebGL a cada atualização de estado. Nós de mídia (`<canvas>` / `<video>`) são reanexados automaticamente caso tenham sido deslocados entre containers.
 * **Gestão de Áudio Individual:** Permite regular o volume geral do dock e o volume individual de cada participante, persistindo as preferências no `localStorage`.
+* **Ferramentas de Interação Co-op:** Suporta envio e renderização de Pings (apontador laser) via clique na tela de vídeo (`msg.type === 'ping'`), com cálculo de bounding box compensando black bars.
+* **QoL (Quality of Life):** Implementa o botão nativo de Picture-in-Picture (`documentPictureInPicture` ou `captureStream` — exclusivo para abas abertas fora do Discord) e transformações CSS (`transform: scale(...)`) para Zoom & Pan Livre interceptando eventos de `wheel` e `pointermove`.
 
 ---
 
@@ -209,6 +221,10 @@ Coração do roteamento de mídia e isolamento de sessões em memória.
   O servidor sabe quais espectadores já receberam um keyframe. Se um espectador acabou de entrar, pacotes delta (tipo 2) são descartados até que um novo keyframe (tipo 1) seja entregue. Caso demore, o servidor emite uma mensagem `{ type: 'need-keyframe' }` para o transmissor.
 * **Gerenciamento de Backpressure de Socket:**
   Verifica `ws.bufferedAmount`. Se um espectador com conexão degradada ultrapassar `MAX_BUFFERED_BYTES` (512 KB), os quadros são descartados para essa conexão para proteger o consumo de memória RAM do processo Node.js.
+* **Contadores de Tráfego com Bucketing por Segundo:**
+  A função `recordTraffic(counter, direction, bytes)` acumula bytes em variáveis locais (`_currentReceived`, `_currentTransmitted`, `_currentDropped`) e só descarrega no `Map<second, bucket>` quando o relógio de segundos vira. A poda de buckets antigos (>60s) roda no máximo uma vez por segundo, nunca por chunk. `trafficSnapshot(counter, windowSeconds)` lê tanto os buckets já gravados quanto o segundo corrente, garantindo dados em tempo real para o painel administrativo sem sobrecarregar o Event Loop.
+* **Limite de Salas por Instância (`MAX_ROOMS_PER_INSTANCE = 5`):**
+  Cada instância de Activity (canal de voz) pode ter no máximo 5 salas abertas simultaneamente. Tentativas de criar além do teto retornam erro 400. Testes que criam múltiplas salas devem usar instâncias separadas para evitar atingir esse limite.
 * **Sweeper Automático de Limpeza:**
   Varre as salas a cada 2 segundos. Salas vazias são encerradas após o período de carência (`EMPTY_GRACE_MS = 30s`). Transmissões de usuários que saíram da atividade são derrubadas após `SEM_PRESENCA_MS = 10s`.
 
@@ -222,18 +238,20 @@ Módulo zero-dependency para criação de tokens seguros usando `crypto.createHm
 ### 4.4 Desktop App: Aplicativo Electron e Áudio Nativo
 
 Localizado em `desktop-app/`, é uma aplicação Electron para Windows voltada a compartilhamento de tela com captura exclusiva de áudio de janelas.
-* **Addon C++ Nativo (`desktop-app/native/audio_mixer.cc`):**
-  Interage diretamente com as APIs do Windows (WASAPI Loopback Capture) via `node-addon-api`. Permite capturar o som emitido especificamente por um executável de jogo ou aplicativo, evitando capturar o próprio áudio da chamada do Discord.
+* **Addon C++ Nativo (`desktop-app/native/audio_mixer.cpp`):**
+  Interage diretamente com as APIs do Windows (WASAPI Loopback Capture) via `node-addon-api`. Permite capturar o som emitido especificamente por um executável de jogo ou aplicativo, evitando capturar o próprio áudio da chamada do Discord. O ciclo de vida da ThreadSafeFunction e instâncias COM é estritamente controlado via `Release()` para prevenir memory leaks de RAM (que poderiam engasgar o app).
 * **Isolamento de Processos Electron:**
-  Utiliza `contextIsolation: true`, scripts de `preload.js` e comunicação assíncrona estrita via IPC.
+  Utiliza `contextIsolation: true`, scripts de `preload.js` e comunicação assíncrona estrita via IPC. Inclui atalhos globais (como `Ctrl+Shift+C` para privacidade/censura imediata).
 
 ---
 
-### 4.5 Scripts: DevOps, Túneis e Smoke Tests
+### 4.5 Scripts: DevOps, Túneis e Testes E2E/Smoke
 
 * **[scripts/configurar.mjs](file:///d:/discord-screen/scripts/configurar.mjs):** Assistente interativo que orienta a criação do aplicativo no portal do Discord, gera segredos criptográficos aleatórios e grava o `.env`.
 * **[scripts/tunel.mjs](file:///d:/discord-screen/scripts/tunel.mjs):** Baixa o binário do `cloudflared` caso necessário e estabelece um túnel HTTPS público para testes imediatos da Activity sem necessidade de configurar VPS ou portas de roteador.
-* **[scripts/smoke.mjs](file:///d:/discord-screen/scripts/smoke.mjs):** Suíte de testes ponta a ponta sem browser que simula múltiplos transmissores e espectadores WebSockets, testando autenticação, senhas, keyframes e isolamento de salas.
+* **[scripts/smoke.mjs](file:///d:/discord-screen/scripts/smoke.mjs):** Suíte de testes ponta a ponta sem browser que simula múltiplos transmissores e espectadores WebSockets, testando autenticação, senhas, keyframes e isolamento de salas. Utiliza instâncias separadas (`CANAL_A` para testes de API de salas, `CANAL_B` para testes de relay) para não exceder o teto de `MAX_ROOMS_PER_INSTANCE`. Requer `VITEST=1` ou `NODE_ENV !== 'production'` para contornar o rate limiter do Express. Variáveis `SMOKE_BASE` e `SMOKE_WS` apontam para o servidor local (padrão `localhost:3001`).
+* **[scripts/stress.mjs](file:///d:/discord-screen/scripts/stress.mjs):** Ferramenta de load testing. Instancia bots simulados via WebSocket para testar o backpressure do processo Node.js e consumo de CPU, validando suporte massivo de espectadores consumindo mídia simultaneamente.
+* **[tests/e2e/sandbox.spec.js](file:///d:/discord-screen/tests/e2e/sandbox.spec.js):** Suíte E2E automatizada baseada em Playwright. Utiliza a página `server/public/sandbox.html` para mockar o ambiente isolado do Discord (SDK, mock de popups e injeção de parâmetros). Garante a funcionalidade do frontend (interface, participantes) sem exigir interação manual no portal da Discord.
 
 ---
 
@@ -261,6 +279,9 @@ Todos os dados de streaming são transmitidos como arrays de bytes sem container
 
 ### 5.2 Mensagens de Controle (JSON via WebSocket)
 
+#### Servidor → Todos
+* `{ type: 'ping', slot: number, userId: string, x: number, y: number }`: Repassa o ping solicitado para todos os clientes ativos (incluindo o transmissor e os espectadores), a fim de renderizar a animação do apontador laser.
+
 #### Transmissor → Servidor
 * `{ type: 'start' }`: Anuncia o início do fluxo de mídia.
 * `{ type: 'config', config }`: Entrega o `decoderConfig` de vídeo (codec, largura, altura, colorSpace, description).
@@ -269,6 +290,7 @@ Todos os dados de streaming são transmitidos como arrays de bytes sem container
 * `{ type: 'stop', reason }`: Encerra a transmissão.
 
 #### Espectador → Servidor
+* `{ type: 'ping-req', slot: number, x: number, y: number }`: Solicita o envio de um ping/laser nas coordenadas X/Y proporcionais (0.0 a 1.0).
 * `{ type: 'watch', slot: number }`: Solicita recebimento dos bytes daquele slot.
 * `{ type: 'unwatch', slot: number }`: Cancela recebimento de bytes do slot.
 * `{ type: 'need-keyframe', slot: number }`: Solicita ao transmissor a geração forçada de um novo keyframe.
@@ -294,10 +316,19 @@ Qualquer chamada feita pela Activity dentro do Discord (seja `fetch` para rotas 
 O servidor Express nunca deve enviar headers restritivos padrão como `X-Frame-Options: SAMEORIGIN` ou `Content-Security-Policy: frame-ancestors 'self'`. Os headers em [server/index.js](file:///d:/discord-screen/server/index.js) devem sempre permitir a cadeia de domínios do Discord (`discord.com` e `*.discordsays.com`), mantendo `X-Frame-Options: ALLOWALL` para anular filtros de proxies intermediários.
 
 ### ⚠️ 5. Sincronia entre Constantes de Limpeza e Testes
-A constante `EMPTY_GRACE_MS` em [server/rooms.js](file:///d:/discord-screen/server/rooms.js) dita o tempo de sobrevivência de salas vazias. Ao alterar este valor, sincronize obrigatoriamente as constantes `CARENCIA` em [server/rooms-limpeza.test.js](file:///d:/discord-screen/server/rooms-limpeza.test.js) para evitar falhas de fake timers nos testes automatizados.
+A constante `EMPTY_GRACE_MS` em [server/rooms.js](file:///d:/discord-screen/server/rooms.js) dita o tempo de sobrevivência de salas vazias. Ao alterar este valor, sincronize obrigatoriamente as constantes `CARENCIA` em [server/rooms-limpeza.test.js](file:///d:/discord-screen/server/rooms-limpeza.test.js) para evitar falhas de fake timers nos testes automatizados. Da mesma forma, os testes de tráfego em `rooms-limpeza.test.js` dependem de `vi.advanceTimersByTime(1000)` para forçar o flush dos acumuladores locais de `recordTraffic` para o Map de buckets — sem esse avanço, o bucket do segundo corrente não é materializado e a asserção falha.
 
 ### ⚠️ 6. Prevenção de Requisições N+1 na API do Discord
 Ao resolver canais de voz de usuários com o bot em [server/index.js](file:///d:/discord-screen/server/index.js), **nunca** itere por todos os servidores do bot disparando requisições REST paralelas. Limite as buscas ao servidor específico (`guildId`) ou utilize cache com throttling para evitar banimento por Rate Limit (HTTP 429).
+
+### ⚠️ 7. Limite de Salas por Instância no Smoke Test
+O servidor impõe `MAX_ROOMS_PER_INSTANCE = 5`. O smoke test (`scripts/smoke.mjs`) cria múltiplas salas durante a execução (Sala de Alice, Sala Aberta, Sala Trancada, Cofre, etc.). Testes que precisam de salas adicionais (como os de relay) **devem** usar uma instância separada (`CANAL_B`) para não estourar o teto e receber erro `400`. Nunca concentre todas as salas de teste numa única instância.
+
+### ⚠️ 8. Isolamento de Contexto E2E (Playwright)
+A suíte E2E no Playwright roda os testes carregando a `sandbox.html`. Dado que o backend consolida memória de instâncias via URL, **sempre utilize o ID de instância randômico** (`Date.now()`) no query parameter para que um teste não interfira nas salas e usuários do outro. Recomenda-se modo `serial` ao emular cenários extensos de UI para garantir estabilidade, já que o proxy é compartilhado no processo backend executado paralelamente.
+
+### ⚠️ 9. Cross-Origin em Testes Locais e PUBLIC_ORIGIN
+O servidor Node utiliza a variável de ambiente `PUBLIC_ORIGIN` (geralmente apontando para o túnel, ex: `https://meu-tunel.trycloudflare.com`) para gerar a URL da aba de captura (`shareUrl`). Ao rodar testes E2E (`npm run test:e2e`) sem o túnel rodando em paralelo localmente, ou em ambientes isolados, a aba de captura externa vai tentar navegar para o túnel remoto, causando falhas de *timeout* nos testes, pois a conexão WebSocket "vaza" para fora do ambiente de teste e atinge a VPS remota ou falha se a URL estiver inacessível. **Solução:** sempre execute a suíte de testes com `PUBLIC_ORIGIN='http://localhost:3001'` (ou a porta correspondente configurada em `PLAYWRIGHT_TEST_BASE_URL`) para manter a resolução DNS apontando restritamente para o processo local instanciado.
 
 ---
 
@@ -309,11 +340,11 @@ O código atual possui arquivos extensos (`main.js`, `index.js`, `broadcaster.js
 * Subcomponentes visuais do cliente devem residir em módulos de UI independentes (`client/src/components/`).
 * Utilitários de rede e estado devem ser organizados em camadas de serviço (`services/`).
 
-### B. Manuseio do DOM sem Recriação Destrutiva
-Evite o uso de `grid.replaceChildren()` sistemático em `client/src/main.js`. Prefira atualizações pontuais baseadas em chaves de identificação dos participantes (Keyed Reconciliation), atualizando classes e nós existentes para evitar *Layout Thrashing* e quedas de FPS na tela.
+### B. Manuseio do DOM sem Recriação Destrutiva (Implementado)
+O `client/src/main.js` utiliza `patchChildren()` para reconciliação de nós do DOM por diffing, e `tileCache` para cache de tiles por chave composta (`userId-slot-palco-semVideo`). **Nunca substitua** esse mecanismo por `grid.replaceChildren()` ou `innerHTML` — a recriação destrutiva destrói contextos WebGL/Canvas, reinicia decoders de vídeo, e causa layout thrashing visível como flashes de tela preta. O cache deve periodicamente **podar chaves órfãs** (participantes que já saíram) para evitar memory leaks infinites em salas com altíssima rotatividade.
 
-### C. Alívio de Métricas no Event Loop
-No servidor de mídia ([server/rooms.js](file:///d:/discord-screen/server/rooms.js)), evite manipulações pesadas de estruturas `Map` ou alocações de objetos a cada chunk recebido. Registre bytes em contadores inteiros simples e processe taxas por segundo em timers consolidados.
+### C. Alívio de Métricas no Event Loop (Implementado)
+No servidor de mídia ([server/rooms.js](file:///d:/discord-screen/server/rooms.js)), `recordTraffic()` acumula bytes em variáveis numéricas locais (`_currentReceived`, `_currentTransmitted`, `_currentDropped`) e descarrega no `Map<second, bucket>` apenas quando o segundo do relógio vira. **Nunca reverta** para acessos ao Map por chunk — um stream a 60 FPS com 10 espectadores gera ~600 chunks/segundo, e o overhead de Map.get/set a cada um saturava o Event Loop.
 
 ---
 
@@ -360,6 +391,9 @@ npm run format
 
 # Executar teste de fumaça ponta a ponta sem browser (requer servidor rodando)
 npm run smoke
+
+# Executar suíte de testes E2E completos (Playwright)
+npm run test:e2e
 ```
 
 ### Aplicativo Desktop (Electron)

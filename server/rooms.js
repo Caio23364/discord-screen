@@ -31,10 +31,10 @@ export const FONTES = new Set(['tela', 'camera']);
 // Sala é objeto em memória criado por qualquer pessoa autenticada: sem teto,
 // um laço de "criar sala" consome a RAM do processo.
 const MAX_ROOMS_PER_INSTANCE = 5;
-const MAX_BUFFERED_BYTES = 512 * 1024;
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 // Intervalo mínimo entre dois pedidos de keyframe para a mesma transmissão.
-const KEYFRAME_ASK_EVERY_MS = 3000;
+const KEYFRAME_ASK_EVERY_MS = 1500;
 const MAX_NAME = 32;
 const MAX_ROOM_NAME = 40;
 
@@ -71,6 +71,12 @@ function trafficCounter() {
     receivedBytes: 0,
     transmittedBytes: 0,
     droppedBytes: 0,
+    
+    _currentSecond: 0,
+    _currentReceived: 0,
+    _currentTransmitted: 0,
+    _currentDropped: 0,
+    
     buckets: new Map(),
     lastPrunedSecond: 0,
   };
@@ -78,24 +84,46 @@ function trafficCounter() {
 
 function recordTraffic(counter, direction, bytes) {
   if (!counter || !Number.isFinite(bytes) || bytes <= 0) return;
+
+  // 1. Acumulador total (histórico): nunca é podado.
+  if (direction === 'receivedBytes') counter.receivedBytes += bytes;
+  else if (direction === 'transmittedBytes') counter.transmittedBytes += bytes;
+  else if (direction === 'droppedBytes') counter.droppedBytes += bytes;
+
+  // 2. Flush do segundo anterior para o Map de buckets, se o segundo virou.
   const second = Math.floor(Date.now() / 1000);
-  let bucket = counter.buckets.get(second);
-  if (!bucket) {
-    bucket = { receivedBytes: 0, transmittedBytes: 0, droppedBytes: 0 };
-    counter.buckets.set(second, bucket);
-  }
+  
+  if (counter._currentSecond !== second) {
+    if (counter._currentSecond !== 0) {
+      let bucket = counter.buckets.get(counter._currentSecond);
+      if (!bucket) {
+        bucket = { receivedBytes: 0, transmittedBytes: 0, droppedBytes: 0 };
+        counter.buckets.set(counter._currentSecond, bucket);
+      }
+      bucket.receivedBytes += counter._currentReceived;
+      bucket.transmittedBytes += counter._currentTransmitted;
+      bucket.droppedBytes += counter._currentDropped;
+    }
+    counter._currentSecond = second;
+    counter._currentReceived = 0;
+    counter._currentTransmitted = 0;
+    counter._currentDropped = 0;
 
-  counter[direction] += bytes;
-  bucket[direction] += bytes;
-
-  // Um stream pode entregar centenas de chunks por segundo. A limpeza roda no
-  // maximo uma vez por segundo por contador, nunca uma vez por chunk.
-  if (counter.lastPrunedSecond !== second) {
-    counter.lastPrunedSecond = second;
-    for (const key of counter.buckets.keys()) {
-      if (key < second - 60) counter.buckets.delete(key);
+    // Um stream pode entregar centenas de chunks por segundo. A limpeza roda no
+    // maximo uma vez por segundo por contador, nunca uma vez por chunk.
+    if (counter.lastPrunedSecond !== second) {
+      counter.lastPrunedSecond = second;
+      for (const key of counter.buckets.keys()) {
+        if (key < second - 60) counter.buckets.delete(key);
+      }
     }
   }
+
+  // 3. Acumulador do segundo corrente (janela temporal): somado após o flush
+  //    para não misturar bytes do novo segundo no bucket do segundo anterior.
+  if (direction === 'receivedBytes') counter._currentReceived += bytes;
+  else if (direction === 'transmittedBytes') counter._currentTransmitted += bytes;
+  else if (direction === 'droppedBytes') counter._currentDropped += bytes;
 }
 
 function trafficSnapshot(counter, windowSeconds = 5) {
@@ -121,6 +149,12 @@ function trafficSnapshot(counter, windowSeconds = 5) {
     receivedBytes += bucket.receivedBytes;
     transmittedBytes += bucket.transmittedBytes;
     droppedBytes += bucket.droppedBytes;
+  }
+  
+  if (counter._currentSecond >= firstSecond) {
+    receivedBytes += counter._currentReceived;
+    transmittedBytes += counter._currentTransmitted;
+    droppedBytes += counter._currentDropped;
   }
 
   const actualWindow = Math.max(1, Math.min(windowSeconds, (now - counter.startedAt) / 1000));
@@ -598,6 +632,23 @@ function freeSlot(room) {
   return null;
 }
 
+export function broadcastPing(room, slot, wsInfo, x, y) {
+  const msg = { type: 'ping', slot, user: wsInfo, x, y };
+  
+  // Enviar para todos os viewers que estão assistindo este slot
+  for (const v of room.viewers) {
+    if (v.__watching?.has(slot)) {
+      sendJson(v, msg);
+    }
+  }
+
+  // Enviar para os controles (abas de captura do dono do slot)
+  const entry = room.slots.get(slot);
+  if (entry) {
+    toControls(room, entry.info.id, msg);
+  }
+}
+
 /** Retorna a entry criada, ou uma string com o motivo da recusa. */
 export function attachBroadcaster(room, ws, info, fonte = 'tela') {
   const chave = chaveDe(info.id, fonte);
@@ -829,6 +880,7 @@ export function watch(room, ws, slot) {
   sendJson(entry.ws, { type: 'rtc-want', peer: ws.__peerId });
 
   atualizarChunks(room, entry);
+  reavaliarCodec(room, slot);
   broadcastState(room);
 }
 
@@ -837,6 +889,7 @@ export function unwatch(room, ws, slot) {
   if (!ws.__watching.delete(slot)) return;
   ws.__primed.delete(slot);
   encerrarPeer(room, ws, slot);
+  reavaliarCodec(room, slot);
   broadcastState(room);
 }
 
@@ -845,6 +898,24 @@ export function requestKeyframeViewer(room, ws, slot) {
   if (!entry || !entry.streaming) return;
   if (!ws.__watching.has(slot)) return;
   requestKeyframe(entry);
+}
+
+function reavaliarCodec(room, slot) {
+  const entry = room.slots.get(slot);
+  if (!entry || !entry.ws) return;
+
+  let needVp8 = false;
+  for (const v of room.viewers) {
+    if (v.__watching?.has(slot) && v.__env === 'discord') {
+      needVp8 = true;
+      break;
+    }
+  }
+
+  if (entry.requireVp8 !== needVp8) {
+    entry.requireVp8 = needVp8;
+    sendJson(entry.ws, { type: 'codec-preference', requireVp8: needVp8 });
+  }
 }
 
 // ------------------------------------------------------------------- WebRTC
@@ -965,7 +1036,10 @@ export function detachViewer(room, ws) {
   // Sai antes de avisar: o recount de `atualizarChunks` não pode contar quem
   // acabou de fechar a aba como alguém que ainda precisa dos quadros.
   room.viewers.delete(ws);
-  for (const slot of ws.__watching ?? []) encerrarPeer(room, ws, slot);
+  for (const slot of ws.__watching ?? []) {
+    encerrarPeer(room, ws, slot);
+    reavaliarCodec(room, slot);
+  }
   broadcastState(room);
 }
 

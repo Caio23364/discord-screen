@@ -13,13 +13,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPlayer } from './player.js';
 
-const BUFFER_MS = 80;
+const BUFFER_MS = 150;
 const KEYFRAME = 1;
 const DELTA = 2;
 
 let agora = 0;
 let pendentes = [];
 let desenhados = [];
+let decoders = [];
 
 /** Canvas de mentira: o player só olha getContext, width/height e o retângulo. */
 function canvasFalso() {
@@ -61,6 +62,7 @@ beforeEach(() => {
   agora = 1000;
   pendentes = [];
   desenhados = [];
+  decoders = [];
 
   vi.spyOn(performance, 'now').mockImplementation(() => agora);
   globalThis.requestAnimationFrame = (cb) => {
@@ -75,9 +77,11 @@ beforeEach(() => {
     constructor({ output }) {
       this.output = output;
       this.state = 'unconfigured';
+      decoders.push(this);
     }
-    configure() {
+    configure(config) {
       this.state = 'configured';
+      this.config = config;
     }
     decode(chunk) {
       this.output({
@@ -109,6 +113,32 @@ function player() {
   expect(p.start({ codec: 'vp8', codedWidth: 1280, codedHeight: 720 })).toBe(true);
   return p;
 }
+
+describe('configuração do decoder', () => {
+  it('repassa o formato annexb ao VideoDecoder', () => {
+    // Sem isso o decoder presume avcC. Um bitstream annexb (o que quem
+    // transmite prefere, ver shared/broadcaster.js) recusa todo quadro nesse
+    // formato — inclusive o keyframe, então nunca se recupera sozinho.
+    createPlayer(canvasFalso(), {}).start({
+      codec: 'avc1.64002a',
+      codedWidth: 1280,
+      codedHeight: 720,
+      avc: { format: 'annexb' },
+    });
+
+    expect(decoders.at(-1).config.avc).toEqual({ format: 'annexb' });
+  });
+
+  it('não manda avc quando a origem não mandou (avcC, o padrão)', () => {
+    createPlayer(canvasFalso(), {}).start({
+      codec: 'avc1.64002a',
+      codedWidth: 1280,
+      codedHeight: 720,
+    });
+
+    expect(decoders.at(-1).config).not.toHaveProperty('avc');
+  });
+});
 
 describe('ritmo de exibição', () => {
   it('não desenha o quadro na chegada — ele espera a vez', () => {
@@ -175,9 +205,9 @@ describe('ritmo de exibição', () => {
       });
     };
 
-    // Vinte quadros de uma vez, sem deixar o relógio andar: nenhum tem a vez
+    // Setenta quadros de uma vez, sem deixar o relógio andar: nenhum tem a vez
     // ainda, e a fila tem que se defender sozinha.
-    for (let i = 0; i < 20; i++) p.push(pacote(i === 0 ? KEYFRAME : DELTA, i * 33));
+    for (let i = 0; i < 70; i++) p.push(pacote(i === 0 ? KEYFRAME : DELTA, i * 33));
 
     // VideoFrame segura memória de GPU: descartar sem fechar trava a aba.
     expect(fechados.length).toBeGreaterThan(0);

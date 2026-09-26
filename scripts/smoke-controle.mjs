@@ -8,8 +8,8 @@
  */
 import WebSocket from 'ws';
 
-const BASE = 'http://localhost:3001';
-const WSB = 'ws://localhost:3001';
+const BASE = process.env.SMOKE_BASE || 'http://localhost:3001';
+const WSB = process.env.SMOKE_WS || 'ws://localhost:3001';
 const api = async (p, b) =>
   (
     await fetch(BASE + p, {
@@ -42,9 +42,9 @@ await new Promise((r) => ctrl.on('open', r));
 check('a aba de controle conecta', ctrl.readyState === WebSocket.OPEN);
 
 // Ninguém assiste e ninguém transmite: a sala está vazia desde que nasceu.
-// A carência é de 12s e a varredura roda a cada 4s, então 20s cobre com folga.
-console.log('esperando a varredura fechar a sala vazia (20s)…');
-await new Promise((r) => setTimeout(r, 20_000));
+// A carência é de 30s (EMPTY_GRACE_MS) e a varredura roda a cada 2s, então 32s cobre com folga.
+console.log('esperando a varredura fechar a sala vazia (32s)…');
+await new Promise((r) => setTimeout(r, 32_000));
 
 check(
   'a aba foi avisada de que a sala fechou',

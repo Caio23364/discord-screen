@@ -502,7 +502,7 @@ describe('/api/rooms/call', () => {
     const me = await identidade({ instance_id: 'call-c', call: 'canal-9' });
     const corpo = await (await post('/api/rooms/call', { identity: me.identity })).json();
 
-    expect(corpo.roomId).toBe('call-canal-9');
+    expect(corpo.roomId).toBe('dm-canal-9');
   });
 
   it('quem não está na call não entra na sala dela', async () => {

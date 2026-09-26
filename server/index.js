@@ -15,6 +15,7 @@ import { signToken, verifyToken } from './tokens.js';
 import * as R from './rooms.js';
 import { systemSnapshot, startSampling } from './system.js';
 import { buildAdminDashboard } from './admin.js';
+import { getConfig, updateConfig } from './config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
@@ -36,6 +37,7 @@ const {
 // redirect do OAuth vira "//auth/callback", que não bate com o endereço
 // cadastrado no portal. O login falha sem explicar nada.
 const PUBLIC_ORIGIN = ORIGEM_CRUA.replace(/[/]+$/, '');
+const NO_AUTH = process.argv.includes('--noauth');
 
 const isProd = NODE_ENV === 'production';
 // Mais de uma pessoa administra: separe os IDs por virgula. Um Set porque a
@@ -210,6 +212,10 @@ app.use(
 
 /** Troca o code do OAuth pelo access_token. O secret nunca sai do servidor. */
 app.post('/api/token', async (req, res) => {
+  if (NO_AUTH) {
+    return res.json({ access_token: req.body.code || 'fake-noauth-token' });
+  }
+
   const { code, client_id } = req.body ?? {};
   if (!code) return res.status(400).json({ error: 'code obrigatorio' });
 
@@ -281,26 +287,43 @@ app.post('/api/session', async (req, res) => {
     const guildId = /^[0-9]{15,21}$/.test(String(guild_id ?? '')) ? String(guild_id) : null;
     const channelId = /^[0-9]{15,21}$/.test(String(channel_id ?? '')) ? String(channel_id) : null;
 
-    // Dispara requests em paralelo para reduzir a latência total ("Está demorando...")
-    const [me, guildName] = await Promise.all([
-      fetch('https://discord.com/api/users/@me', {
-        headers: { Authorization: `Bearer ${access_token}` },
-        signal: AbortSignal.timeout(5000),
-      }).then((r) => r.json()),
-      resolveGuildName(guildId),
-    ]);
+    let me;
+    let guildName = null;
+    let presenca = 'ok';
 
-    if (!me?.id) return res.status(401).json({ error: 'token invalido' });
+    if (NO_AUTH) {
+      const mockId = (access_token && access_token !== 'fake-noauth-token') ? access_token : '999999999999999999';
+      me = { id: mockId, username: 'TestUser_' + mockId, global_name: 'Usuário Teste ' + mockId, avatar: null };
+      guildName = guildId ? 'Servidor Local (No Auth)' : null;
+    } else {
+      // Dispara requests em paralelo para reduzir a latência total ("Está demorando...")
+      const responses = await Promise.all([
+        fetch('https://discord.com/api/users/@me', {
+          headers: { Authorization: `Bearer ${access_token}` },
+          signal: AbortSignal.timeout(5000),
+        }).then((r) => r.json()),
+        resolveGuildName(guildId),
+      ]);
+      me = responses[0];
+      guildName = responses[1];
 
-    // Trava de servidor compartilhado
-    const shared = await hasSharedGuild(access_token, guildId);
-    if (!shared) {
-      return res.status(403).json({ error: 'Você precisa estar no mesmo servidor que o bot para usar o aplicativo.' });
-    }
+      if (!me?.id) return res.status(401).json({ error: 'token invalido' });
 
-    const presenca = await inVoiceChannel(guildId, channelId, me.id);
-    if (presenca === 'fora') {
-      return res.status(403).json({ error: 'Entre na call antes de abrir a atividade.' });
+      // Trava de servidor compartilhado
+      if (getConfig().requireSharedGuild) {
+        const shared = await hasSharedGuild(access_token, guildId);
+        if (!shared) {
+          presenca = 'sem-servidor';
+        }
+      }
+      if (presenca === 'sem-servidor') {
+        return res.status(403).json({ error: 'Você precisa estar no mesmo servidor que o bot para usar o aplicativo.' });
+      }
+
+      presenca = await inVoiceChannel(guildId, channelId, me.id);
+      if (presenca === 'fora') {
+        return res.status(403).json({ error: 'Entre na call antes de abrir a atividade.' });
+      }
     }
 
     // O canal entra no token assinado, não fica só na resposta: é o que permite
@@ -615,6 +638,40 @@ function identityOf(req, res) {
   return payload;
 }
 
+app.get('/download', (req, res) => {
+  const payload = verifyToken(req.query.identity);
+  if (!payload || payload.scope !== 'identity') {
+    return res.status(401).send('Acesso negado. Por favor, faça login.');
+  }
+  
+  const distDir = path.join(__dirname, '..', 'dist-desktop');
+  if (!fs.existsSync(distDir)) {
+    return res.status(404).send('Aplicativo desktop ainda não foi empacotado.');
+  }
+  
+  let files;
+  try {
+    files = fs.readdirSync(distDir);
+  } catch (err) {
+    return res.status(404).send('Erro ao ler diretório de downloads.');
+  }
+  
+  const exeFiles = files.filter(f => f.endsWith('.exe'));
+  
+  if (exeFiles.length === 0) {
+    return res.status(404).send('Aplicativo desktop ainda não foi empacotado.');
+  }
+  
+  exeFiles.sort((a, b) => {
+    const statA = fs.statSync(path.join(distDir, a));
+    const statB = fs.statSync(path.join(distDir, b));
+    return statB.mtimeMs - statA.mtimeMs;
+  });
+  
+  const latestExe = exeFiles[0];
+  res.download(path.join(distDir, latestExe), latestExe);
+});
+
 /**
  * Tokens de acesso a uma sala, emitidos depois de passar pela senha.
  *
@@ -673,6 +730,19 @@ app.post('/api/rooms/create', (req, res) => {
   res.json(issueRoomTokens(room.id, me));
 });
 
+app.get('/api/admin/config', requireAdmin, (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(getConfig());
+});
+
+app.post('/api/admin/config', requireAdmin, (req, res) => {
+  if (typeof req.body.requireSharedGuild !== 'boolean') {
+    return res.status(400).json({ error: 'requireSharedGuild deve ser booleano' });
+  }
+  const updated = updateConfig({ requireSharedGuild: req.body.requireSharedGuild });
+  res.json(updated);
+});
+
 /**
  * A sala desta call. É a única sala que existe dentro do Discord: a atividade
  * abre nela direto, sem lista, porque escolher entre uma opção só não é escolha.
@@ -682,7 +752,7 @@ app.post('/api/rooms/create', (req, res) => {
  * — o mesmo escopo que a lista de salas sempre usou, então nada se afrouxa, e a
  * atividade continua funcionando para quem não quer criar um bot.
  */
-const salaDaCall = (me) => (me.call ? `call-${me.call}` : `atividade-${me.instance}`);
+const salaDaCall = (me) => (me.call ? (me.guild ? `call-${me.call}` : `dm-${me.call}`) : `atividade-${me.instance}`);
 
 app.post('/api/rooms/call', async (req, res) => {
   const me = identityOf(req, res);
@@ -739,7 +809,7 @@ app.post('/api/rooms/call', async (req, res) => {
           resolvedGuildName = await resolveGuildName(achou.guildId);
           
           // Atualiza a instância do usuário para essa requisição
-          me.instance = `call-${resolvedChannel}`;
+          me.instance = (resolvedGuild ? 'call-' : 'dm-') + resolvedChannel;
           me.call = resolvedChannel;
           me.channel = resolvedChannel;
           me.guild = resolvedGuild;
@@ -916,9 +986,11 @@ app.get('/auth/callback', async (req, res) => {
       return res.redirect(adminFlow ? '/admin?error=perfil_falhou' : '/?erro=perfil_falhou');
     }
 
-    const shared = await hasSharedGuild(token.access_token);
-    if (!shared) {
-      return res.redirect(adminFlow ? '/admin?error=not_in_server' : '/?erro=not_in_server');
+    if (getConfig().requireSharedGuild) {
+      const shared = await hasSharedGuild(token.access_token);
+      if (!shared) {
+        return res.redirect(adminFlow ? '/admin?error=not_in_server' : '/?erro=not_in_server');
+      }
     }
 
     if (adminFlow) {
@@ -986,7 +1058,7 @@ app.get('/auth/callback', async (req, res) => {
         }
       }
 
-      const instance = callInfo.call ? `call-${callInfo.call}` : WEB_INSTANCE;
+      const instance = callInfo.call ? (callInfo.guild ? `call-${callInfo.call}` : `dm-${callInfo.call}`) : WEB_INSTANCE;
       const identity = issueIdentity(
         instance,
         me.id,
@@ -1109,6 +1181,7 @@ app.get('/api/admin/metrics', requireAdmin, (_req, res) => {
       botConfigured: Boolean(DISCORD_BOT_TOKEN),
       adminIds: [...ADMIN_IDS],
       sessionSecretConfigured: Boolean(process.env.SESSION_SECRET),
+      requireSharedGuild: getConfig().requireSharedGuild,
     },
   });
   res.json(dashboard);
@@ -1200,15 +1273,18 @@ server.on('upgrade', (req, socket, head) => {
   // A aba de captura abre esta conexão ao carregar, antes de qualquer captura.
   const controle = url.searchParams.get('modo') === 'controle';
 
+  const env = url.searchParams.get('env') === 'discord' ? 'discord' : 'browser';
+
   wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req, payload, fonte, controle);
+    wss.emit('connection', ws, req, payload, fonte, controle, env);
   });
 });
 
-wss.on('connection', (ws, _req, auth, fonte, controle) => {
+wss.on('connection', (ws, _req, auth, fonte, controle, env) => {
   ws.__connectedAt = Date.now();
   ws.__rttMs = null;
   ws.__pingSentAt = null;
+  ws.__env = env;
   const room = R.getRoom(auth.room);
 
   // A sala pode ter fechado entre a emissão do token e a conexão.
@@ -1247,6 +1323,31 @@ function handleControl(ws, room, auth) {
   };
   ws.on('close', sair);
   ws.on('error', sair);
+
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'config-pings') {
+        ws.__allowPings = Boolean(msg.allow);
+      } else if (msg.type === 'ping') {
+        const now = Date.now();
+        if (!ws.__lastPing || now - ws.__lastPing > 200) {
+          ws.__lastPing = now;
+          if (typeof msg.x === 'number' && msg.x >= 0 && msg.x <= 1 && typeof msg.y === 'number' && msg.y >= 0 && msg.y <= 1) {
+            const info = { id: auth.uid, name: auth.name, avatar: auth.av ?? null };
+            for (const [slot, entry] of room.slots.entries()) {
+              if (entry.info.id === auth.uid) {
+                R.broadcastPing(room, slot, info, msg.x, msg.y);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignora mensagens mal formadas
+    }
+  });
 }
 
 function handleBroadcaster(ws, room, info, fonte) {
@@ -1326,6 +1427,8 @@ function handleViewer(ws, room, auth) {
       z.object({ type: z.literal('start-broadcast'), fonte: z.string(), opcoes: z.any().optional() }),
       z.object({ type: z.literal('config-broadcast'), opcoes: z.any() }),
       z.object({ type: z.literal('stop-broadcast'), fonte: z.string().optional() }),
+      z.object({ type: z.literal('ping'), slot: z.number().int(), x: z.number().min(0).max(1), y: z.number().min(0).max(1) }),
+      z.object({ type: z.literal('ping-req'), ts: z.number() }),
     ]);
 
     const parsed = viewerMsgSchema.safeParse(msg);
@@ -1344,6 +1447,37 @@ function handleViewer(ws, room, auth) {
 
     if (msg.type === 'unwatch') {
       R.unwatch(room, ws, msg.slot);
+      return;
+    }
+
+    if (msg.type === 'ping') {
+      const now = Date.now();
+      if (!ws.__lastPing || now - ws.__lastPing > 200) {
+        ws.__lastPing = now;
+
+        const entry = room.slots.get(msg.slot);
+        if (entry) {
+          const broadcasterUid = entry.info.id;
+          let allowed = true;
+          if (room.controles) {
+            for (const c of room.controles) {
+              if (c.__controlOf === broadcasterUid && c.__allowPings === false) {
+                allowed = false;
+                break;
+              }
+            }
+          }
+
+          if (allowed) {
+            R.broadcastPing(room, msg.slot, ws.__info, msg.x, msg.y);
+          }
+        }
+      }
+      return;
+    }
+
+    if (msg.type === 'ping-req') {
+      R.sendJson(ws, { type: 'ping-rep', ts: msg.ts });
       return;
     }
 

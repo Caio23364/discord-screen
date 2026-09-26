@@ -118,7 +118,8 @@ public:
     }
     
     HRESULT Wait(IAudioClient** ppAudioClient) {
-        WaitForSingleObject(m_hEvent, INFINITE);
+        DWORD res = WaitForSingleObject(m_hEvent, 2000);
+        if (res != WAIT_OBJECT_0) return E_FAIL;
         if (SUCCEEDED(m_hr) && m_pAudioClient) {
             *ppAudioClient = m_pAudioClient;
             m_pAudioClient->AddRef();
@@ -223,15 +224,21 @@ cleanup:
 
 // ── Capture Thread: WASAPI loopback with PID exclusion ──
 static void CaptureAudioLoop() {
+    // Elevate thread priority to Pro Audio to avoid stuttering under high CPU load (e.g. gaming)
+    DWORD mmcssTask = 0;
+    HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTask);
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+        return;
+    }
     
     IMMDeviceEnumerator* pEnumerator = nullptr;
     IMMDevice* pDevice = nullptr;
     IAudioClient* pAudioClient = nullptr;
     IAudioCaptureClient* pCaptureClient = nullptr;
     IAudioSessionManager2* pSessionManager = nullptr;
-    WAVEFORMATEX* pwfx = nullptr;
     
     std::string currentMode;
     DWORD currentTargetPid = 0;
@@ -277,6 +284,7 @@ static void CaptureAudioLoop() {
         }
     }
     
+    WAVEFORMATEX format = {};
     if (currentMode != "include") {
         // Use standard system endpoint loopback
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -295,34 +303,58 @@ static void CaptureAudioLoop() {
     
     if (!pAudioClient) goto done;
 
-    hr = pAudioClient->GetMixFormat(&pwfx);
-    if (FAILED(hr)) goto done;
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = 2;
+    format.nSamplesPerSec = 48000;
+    format.wBitsPerSample = 16;
+    format.nBlockAlign = (format.nChannels * format.wBitsPerSample) / 8;
+    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+    format.cbSize = 0;
     
-    // Calcule the device's buffer duration to wait dynamically instead of 5ms static
-    // By default 10000000 = 1 sec. For low latency we ask 0 or a very short time.
+    // Let Windows handle the resampling via AUTOCONVERTPCM
     hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                  AUDCLNT_STREAMFLAGS_LOOPBACK,
-                                  0, 0, pwfx, nullptr);
+                                  AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                                  AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                  2000000, 0, &format, nullptr);
     if (FAILED(hr)) goto done;
+
+    HANDLE hEvent;
+    hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!hEvent) goto done;
+
+    hr = pAudioClient->SetEventHandle(hEvent);
+    if (FAILED(hr)) {
+        CloseHandle(hEvent);
+        goto done;
+    }
     
     hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
-    if (FAILED(hr)) goto done;
+    if (FAILED(hr)) {
+        CloseHandle(hEvent);
+        goto done;
+    }
     
     hr = pAudioClient->Start();
-    if (FAILED(hr)) goto done;
+    if (FAILED(hr)) {
+        CloseHandle(hEvent);
+        goto done;
+    }
     
     while (g_isCapturing) {
         if (g_pidsChanged.exchange(false)) {
             std::lock_guard<std::mutex> lock(g_excludeMutex);
-            // If we are falling back, don't overwrite currentMode back to "include"
-            // Actually, g_pidsChanged is checked here ONCE. But we already fetched them at the top!
-            // This is just for dynamic updates while running.
             if (currentMode != "legacy" || g_captureMode != "include") {
                 currentMode = g_captureMode;
                 localExcluded = g_excludedPids;
             }
         }
         
+        // Wait for the OS to wake us up when audio is ready or timeout to allow checking g_isCapturing
+        DWORD waitResult = WaitForSingleObject(hEvent, 100);
+        if (waitResult != WAIT_OBJECT_0) {
+            continue;
+        }
+
         UINT32 packetLength = 0;
         hr = pCaptureClient->GetNextPacketSize(&packetLength);
         
@@ -336,22 +368,21 @@ static void CaptureAudioLoop() {
                 bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT);
                 
                 if (numFramesAvailable > 0) {
-                    size_t bytesToCopy = numFramesAvailable * pwfx->nBlockAlign;
+                    size_t bytesToCopy = numFramesAvailable * format.nBlockAlign;
                     
-                    if (isSilent) {
-                        // Se for silêncio, preenche com zeros no lugar de alocar lixo
-                        static std::vector<uint8_t> silenceData(bytesToCopy, 0);
-                        accumulator.insert(accumulator.end(), silenceData.begin(), silenceData.end());
-                    } else {
-                        accumulator.insert(accumulator.end(), pData, pData + bytesToCopy);
+                    std::vector<uint8_t> convertedBytes(bytesToCopy, 0);
+                    if (!isSilent && pData) {
+                        memcpy(convertedBytes.data(), pData, bytesToCopy);
                     }
+                    
+                    accumulator.insert(accumulator.end(), convertedBytes.begin(), convertedBytes.end());
 
-                    // Envia via IPC apenas quando acumular ~50ms de áudio (reduz a carga da IPC em 5x)
-                    size_t targetBatchSize = (pwfx->nSamplesPerSec / 20) * pwfx->nBlockAlign; // 50ms
+                    // Envia via IPC apenas quando acumular ~50ms de áudio de 48kHz
+                    size_t targetBatchSize = (48000 / 20) * format.nBlockAlign;
                     
                     if (accumulator.size() >= targetBatchSize) {
                         auto* buffer = new std::vector<uint8_t>(std::move(accumulator));
-                        accumulator.clear(); // Prepara para a próxima leva
+                        accumulator.clear();
                         
                         auto callback = [](Napi::Env env, Napi::Function jsCallback, std::vector<uint8_t>* data) {
                             if (env != nullptr && !jsCallback.IsEmpty()) {
@@ -378,20 +409,19 @@ static void CaptureAudioLoop() {
             hr = pCaptureClient->GetNextPacketSize(&packetLength);
             if (FAILED(hr)) break;
         }
-        
-        Sleep(5); // A low wait is normal for non-event loopback. 5ms is fine if we aren't locking mutexes heavily.
     }
     
     pAudioClient->Stop();
+    CloseHandle(hEvent);
 
 done:
-    if (pwfx) CoTaskMemFree(pwfx);
     SafeRelease(pCaptureClient);
     SafeRelease(pAudioClient);
     SafeRelease(pSessionManager);
     SafeRelease(pDevice);
     SafeRelease(pEnumerator);
     CoUninitialize();
+    if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
 }
 
 // ── StartCapture ──
@@ -463,9 +493,7 @@ Napi::Value StartCapture(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, true);
 }
 
-// ── SetExcludedPids (Mutes excluded apps in legacy mode) ──
-const GUID STRAWBERRY_CONTEXT = { 0xdeadbeef, 0xb00b, 0xface, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
-
+// ── SetExcludedPids (Atualiza alvos dinâmicos) ──
 Napi::Value SetExcludedPids(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     
@@ -509,70 +537,9 @@ Napi::Value SetExcludedPids(const Napi::CallbackInfo& info) {
         g_pidsChanged = true;
     }
     
-    if (newMode == "legacy") {
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        bool needUninit = SUCCEEDED(hr);
-        
-        IMMDeviceEnumerator* pEnumerator = nullptr;
-        IMMDevice* pDevice = nullptr;
-        IAudioSessionManager2* pSessionManager = nullptr;
-        IAudioSessionEnumerator* pSessionEnum = nullptr;
-        
-        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                              __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-        if (FAILED(hr)) goto done_update;
-        
-        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-        if (FAILED(hr)) goto done_update;
-        
-        hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&pSessionManager);
-        if (FAILED(hr)) goto done_update;
-        
-        hr = pSessionManager->GetSessionEnumerator(&pSessionEnum);
-        if (FAILED(hr)) goto done_update;
-        
-        {
-            int count = 0;
-            pSessionEnum->GetCount(&count);
-            
-            for (int i = 0; i < count; i++) {
-                IAudioSessionControl* pCtrl = nullptr;
-                IAudioSessionControl2* pCtrl2 = nullptr;
-                ISimpleAudioVolume* pVolume = nullptr;
-                
-                pSessionEnum->GetSession(i, &pCtrl);
-                if (!pCtrl) continue;
-                
-                hr = pCtrl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pCtrl2);
-                if (FAILED(hr) || !pCtrl2) { SafeRelease(pCtrl); continue; }
-                
-                DWORD pid = 0;
-                pCtrl2->GetProcessId(&pid);
-                
-                hr = pCtrl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&pVolume);
-                if (SUCCEEDED(hr) && pVolume) {
-                    if (newExcluded.find(pid) != newExcluded.end()) {
-                        pVolume->SetMute(TRUE, &STRAWBERRY_CONTEXT);
-                    } else {
-                        BOOL isMuted = FALSE;
-                        pVolume->GetMute(&isMuted);
-                        if (isMuted) pVolume->SetMute(FALSE, &STRAWBERRY_CONTEXT);
-                    }
-                    SafeRelease(pVolume);
-                }
-                
-                SafeRelease(pCtrl2);
-                SafeRelease(pCtrl);
-            }
-        }
-        
-done_update:
-        SafeRelease(pSessionEnum);
-        SafeRelease(pSessionManager);
-        SafeRelease(pDevice);
-        SafeRelease(pEnumerator);
-        if (needUninit) CoUninitialize();
-    }
+    // Em modo legacy (Windows 10), não silenciamos mais no nível do SO
+    // pois isso prejudicava o usuário (mutando o app no seu próprio fone de ouvido).
+    // O áudio vazará para a transmissão se o isolamento não for possível pelo SO.
     
     return Napi::Boolean::New(env, true);
 }
@@ -584,47 +551,7 @@ Napi::Value StopCapture(const Napi::CallbackInfo& info) {
     if (g_captureThread.joinable()) {
         g_captureThread.join();
     }
-    
-    // Unmute everything left over in legacy mode
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool needUninit = SUCCEEDED(hr);
-    
-    IMMDeviceEnumerator* pEnumerator = nullptr;
-    IMMDevice* pDevice = nullptr;
-    IAudioSessionManager2* pSessionManager = nullptr;
-    IAudioSessionEnumerator* pSessionEnum = nullptr;
-    
-    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                          __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-    if (SUCCEEDED(hr)) hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-    if (SUCCEEDED(hr)) hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&pSessionManager);
-    if (SUCCEEDED(hr)) hr = pSessionManager->GetSessionEnumerator(&pSessionEnum);
-    
-    if (SUCCEEDED(hr)) {
-        int count = 0;
-        pSessionEnum->GetCount(&count);
-        
-        for (int i = 0; i < count; i++) {
-            IAudioSessionControl* pCtrl = nullptr;
-            ISimpleAudioVolume* pVolume = nullptr;
-            
-            pSessionEnum->GetSession(i, &pCtrl);
-            if (!pCtrl) continue;
-            
-            hr = pCtrl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&pVolume);
-            if (SUCCEEDED(hr) && pVolume) {
-                pVolume->SetMute(FALSE, &STRAWBERRY_CONTEXT);
-                SafeRelease(pVolume);
-            }
-            SafeRelease(pCtrl);
-        }
-    }
-    
-    SafeRelease(pSessionEnum);
-    SafeRelease(pSessionManager);
-    SafeRelease(pDevice);
-    SafeRelease(pEnumerator);
-    if (needUninit) CoUninitialize();
+    // Sem limpeza de legacy mutes, pois não mutamos mais o áudio do SO.
     
     if (g_tsfn) {
         g_tsfn.Release();

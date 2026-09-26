@@ -50,12 +50,16 @@ function guardadas() {
 }
 
 const salvas = guardadas();
+
+const parseFps = (val) => val === 'auto' ? 'auto' : (Number(val) || 60);
+
 const opcoes = {
   // A URL vence o que está guardado: ela carrega a intenção desta abertura.
-  bitrate: Number(query.get('q')) || Number(salvas.bitrate) || 2_500_000,
-  fps: Number(query.get('fps')) || Number(salvas.fps) || 30,
+  bitrate: Number(query.get('q')) || Number(salvas.bitrate) || 8_000_000,
+  fps: parseFps(query.get('fps') || salvas.fps),
   autoBitrate: query.get('auto') !== null ? query.get('auto') === 'true' : (salvas.autoBitrate !== undefined ? salvas.autoBitrate : true),
   dsrEnabled: query.get('dsr') !== null ? query.get('dsr') === 'true' : (salvas.dsrEnabled !== undefined ? salvas.dsrEnabled : false),
+  allowPings: query.get('pings') !== null ? query.get('pings') === 'true' : (salvas.allowPings !== undefined ? salvas.allowPings : true),
 };
 
 function guardar() {
@@ -71,13 +75,16 @@ function espelharOpcoes() {
   $('quadros').value = String(opcoes.fps);
   $('autoBitrate').checked = opcoes.autoBitrate;
   $('dsrEnabled').checked = opcoes.dsrEnabled;
+  $('allowPings').checked = opcoes.allowPings;
 }
 
 function aplicarOpcoes(novas) {
   if (!novas) return;
   if (Number(novas.q)) opcoes.bitrate = Number(novas.q);
-  if (Number(novas.fps)) opcoes.fps = Number(novas.fps);
+  if (novas.fps === 'auto' || Number(novas.fps)) opcoes.fps = novas.fps === 'auto' ? 'auto' : Number(novas.fps);
   if (novas.auto !== undefined) opcoes.autoBitrate = Boolean(novas.auto);
+  if (novas.dsr !== undefined) opcoes.dsrEnabled = Boolean(novas.dsr);
+  if (novas.pings !== undefined) opcoes.allowPings = Boolean(novas.pings);
   // Os selects seguem o valor efetivo: mostrar 5 Mbps enquanto se transmite a
   // 1 Mbps é pior do que não mostrar nada.
   espelharOpcoes();
@@ -91,13 +98,22 @@ function aplicarOpcoes(novas) {
  * a próxima.
  */
 function mudarOpcao(chave, valor) {
-  if (chave === 'autoBitrate') {
+  if (chave === 'autoBitrate' || chave === 'dsrEnabled' || chave === 'allowPings') {
     opcoes[chave] = Boolean(valor);
+  } else if (chave === 'fps' && valor === 'auto') {
+    opcoes[chave] = 'auto';
   } else {
     if (!Number(valor)) return;
     opcoes[chave] = Number(valor);
   }
   guardar();
+
+  if (chave === 'allowPings') {
+    if (controle && controle.readyState === WebSocket.OPEN) {
+      controle.send(JSON.stringify({ type: 'config-pings', allow: opcoes.allowPings }));
+    }
+  }
+
   for (const painel of Object.values(paineis)) painel?.aplicarQualidade?.();
 }
 
@@ -211,6 +227,10 @@ function ligarControle() {
     `${proto}://${location.host}/ws?t=${encodeURIComponent(token)}&modo=controle`,
   );
 
+  controle.addEventListener('open', () => {
+    controle.send(JSON.stringify({ type: 'config-pings', allow: opcoes.allowPings }));
+  });
+
   controle.addEventListener('message', (e) => {
     if (typeof e.data !== 'string') return;
 
@@ -223,6 +243,71 @@ function ligarControle() {
 
     if (msg.type === 'start-request') atenderPedido(msg.fonte, msg.opcoes);
     else if (msg.type === 'config-request') aplicarConfig(msg.opcoes);
+    else if (msg.type === 'ping') {
+      const allowPings = document.getElementById('allowPings');
+      if (allowPings && !allowPings.checked) return;
+
+      const painel = paineis['tela'];
+      if (!painel || !painel.ativo()) return;
+      
+      const preview = document.getElementById('tela-preview');
+      if (!preview) return;
+      
+      const container = preview.parentElement;
+      if (!container) return;
+      
+      const pingEl = document.createElement('div');
+      pingEl.className = 'ping-marker';
+      pingEl.style.position = 'absolute';
+      pingEl.style.width = '24px';
+      pingEl.style.height = '24px';
+      pingEl.style.background = 'var(--cor-destaque)';
+      pingEl.style.color = 'white';
+      pingEl.style.borderRadius = '50%';
+      pingEl.style.display = 'flex';
+      pingEl.style.alignItems = 'center';
+      pingEl.style.justifyContent = 'center';
+      pingEl.style.fontSize = '10px';
+      pingEl.style.fontWeight = 'bold';
+      pingEl.style.pointerEvents = 'none';
+      pingEl.style.zIndex = '100';
+      pingEl.style.boxShadow = '0 0 10px rgba(0,0,0,0.5), 0 0 0 4px rgba(255,255,255,0.2)';
+      pingEl.style.transition = 'opacity 0.4s ease-out, transform 0.4s ease-out';
+      
+      // Calculate letterbox position
+      const rect = preview.getBoundingClientRect();
+      const elW = rect.width;
+      const elH = rect.height;
+      const vidW = preview.videoWidth;
+      const vidH = preview.videoHeight;
+      
+      if (vidW && vidH) {
+        const elAspect = elW / elH;
+        const vidAspect = vidW / vidH;
+        let drawW = elW, drawH = elH, offX = 0, offY = 0;
+        if (elAspect > vidAspect) {
+          drawW = elH * vidAspect;
+          offX = (elW - drawW) / 2;
+        } else if (elAspect < vidAspect) {
+          drawH = elW / vidAspect;
+          offY = (elH - drawH) / 2;
+        }
+        
+        pingEl.style.left = `calc(${offX + (msg.x * drawW)}px - 12px)`;
+        pingEl.style.top = `calc(${offY + (msg.y * drawH)}px - 12px)`;
+      } else {
+        pingEl.style.left = `calc(${msg.x * 100}% - 12px)`;
+        pingEl.style.top = `calc(${msg.y * 100}% - 12px)`;
+      }
+      
+      container.appendChild(pingEl);
+      
+      setTimeout(() => {
+        pingEl.style.opacity = '0';
+        pingEl.style.transform = 'scale(1.5)';
+        setTimeout(() => pingEl.remove(), 400);
+      }, 1500);
+    }
     else if (msg.type === 'room-gone') {
       // Sala fechada: não há a quem transmitir, e insistir na reconexão só
       // gastaria rede contra um id que não existe mais.
@@ -297,6 +382,13 @@ function criarPainel(fonte) {
     const alvo = el('status');
     alvo.textContent = msg;
     alvo.className = `status ${kind}`;
+  }
+
+  function rotuloCursor(cursor) {
+    if (cursor === 'always') return 'cursor sempre visível';
+    if (cursor === 'motion') return 'cursor visível ao mover';
+    if (cursor === 'never') return 'cursor não capturado';
+    return 'cursor não informado pelo navegador';
   }
 
   function mostrarSetup() {
@@ -436,10 +528,12 @@ function criarPainel(fonte) {
       // compartilhamento.
       streamPronto: previa,
       deviceId: camera ? dispositivo : null,
-      onStatus: (s) =>
+      onStatus: (s) => {
+        const cursor = camera ? '' : ` · ${rotuloCursor(s.cursor)}`;
         setStatus(
-          `Codec: ${s.codec} · ${s.width}×${s.height} · captura ${s.direct ? 'direta' : 'via <video>'}`,
-        ),
+          `Codec: ${s.codec} · ${s.width}×${s.height} · captura ${s.direct ? 'direta' : 'via <video>'}${cursor}`,
+        );
+      },
       onStats: (s) => {
         el('viewers').textContent = s.viewers;
         el('fps').textContent = `${s.fps} fps`;
@@ -505,6 +599,20 @@ function criarPainel(fonte) {
   el('stop').addEventListener('click', () =>
     broadcaster?.stop(camera ? 'Câmera desligada.' : 'Transmissão encerrada.'),
   );
+  
+  if (!camera) {
+    let censorLigado = false;
+    const btnCensor = el('censor');
+    btnCensor.addEventListener('click', () => {
+      if (!broadcaster) return;
+      censorLigado = !censorLigado;
+      broadcaster.toggleCensor(censorLigado);
+      btnCensor.classList.toggle('active', censorLigado);
+      btnCensor.innerHTML = censorLigado 
+        ? `<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> CENSURADO`
+        : `<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg> PRIVACIDADE`;
+    });
+  }
 
   // stopPropagation para o clique não chegar ao document e fechar o que acabou
   // de abrir.
@@ -532,6 +640,10 @@ function criarPainel(fonte) {
     parar: () => {
       broadcaster?.stop();
       pararPrevia();
+      if (!camera && el('censor')) {
+        el('censor').classList.remove('active');
+        el('censor').innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg> PRIVACIDADE`;
+      }
     },
     trocarSom: () => broadcaster?.trocarSom(),
   };
@@ -581,7 +693,46 @@ $('qualidade').addEventListener('change', (e) => mudarOpcao('bitrate', e.target.
 $('quadros').addEventListener('change', (e) => mudarOpcao('fps', e.target.value));
 $('autoBitrate').addEventListener('change', (e) => mudarOpcao('autoBitrate', e.target.checked));
 $('dsrEnabled').addEventListener('change', (e) => mudarOpcao('dsrEnabled', e.target.checked));
+$('allowPings').addEventListener('change', (e) => mudarOpcao('allowPings', e.target.checked));
 
 window.addEventListener('beforeunload', () => {
   for (const f of FONTES) paineis[f]?.parar();
 });
+const preview = document.getElementById('tela-preview');
+if (preview) {
+  preview.addEventListener('click', (e) => {
+    const allowPings = document.getElementById('allowPings');
+    if (allowPings && !allowPings.checked) return;
+    if (!controle || controle.readyState !== WebSocket.OPEN) return;
+
+    const rect = preview.getBoundingClientRect();
+    const elW = rect.width;
+    const elH = rect.height;
+    if (elW === 0 || elH === 0) return;
+    
+    const vidW = preview.videoWidth;
+    const vidH = preview.videoHeight;
+    if (vidW === 0 || vidH === 0) return;
+
+    const elAspect = elW / elH;
+    const vidAspect = vidW / vidH;
+    
+    let drawW = elW, drawH = elH;
+    let offX = 0, offY = 0;
+    
+    if (elAspect > vidAspect) {
+      drawW = elH * vidAspect;
+      offX = (elW - drawW) / 2;
+    } else if (elAspect < vidAspect) {
+      drawH = elW / vidAspect;
+      offY = (elH - drawH) / 2;
+    }
+
+    const clickX = e.clientX - rect.left - offX;
+    const clickY = e.clientY - rect.top - offY;
+
+    if (clickX >= 0 && clickX <= drawW && clickY >= 0 && clickY <= drawH) {
+      controle.send(JSON.stringify({ type: 'ping', x: clickX / drawW, y: clickY / drawH }));
+    }
+  });
+}

@@ -3,7 +3,7 @@
   "description": "Fabricio Telas Desktop App",
   "private": true,
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "main": "main.js",
   "scripts": {
     "dev": "vite",
@@ -12,8 +12,8 @@
     "electron": "electron .",
     "start": "npx concurrently \"vite\" \"electron .\"",
     "rebuild": "node-gyp rebuild --target=31.3.1 --arch=x64 --dist-url=https://electronjs.org/headers",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder",
+    "pack": "npm version minor --no-git-tag-version && electron-builder --dir",
+    "dist": "npm version minor --no-git-tag-version && electron-builder",
     "make": "npm run rebuild && npm run build && npm run dist"
   },
   "dependencies": {
@@ -28,7 +28,7 @@
   "build": {
     "appId": "com.fabricio.telas",
     "directories": {
-      "output": "dist-electron"
+      "output": "../dist-desktop"
     },
     "win": {
       "target": "portable",

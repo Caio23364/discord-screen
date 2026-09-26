@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, desktopCapturer, shell, globalShortcut } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import net from 'net';
@@ -10,11 +10,17 @@ const require = createRequire(import.meta.url);
 
 // Import native addon (ignore if fail during dev preview)
 let audioMixer;
+let videoCapture;
 try {
-  // Try to load built addon
+  // Try to load built addons
   audioMixer = require('./build/Release/audio_mixer.node');
 } catch (e) {
   console.warn('Native audio_mixer not loaded:', e.message);
+}
+try {
+  videoCapture = require('./build/Release/video_capture.node');
+} catch (e) {
+  console.warn('Native video_capture not loaded:', e.message);
 }
 
 let mainWindow;
@@ -48,6 +54,12 @@ function createWindow() {
 app.whenReady().then(() => {
   createWindow();
 
+  globalShortcut.register('CommandOrControl+Shift+C', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('toggle-censor');
+    }
+  });
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -59,6 +71,10 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
 });
 
 // IPC: get_capture_sources
@@ -93,7 +109,8 @@ ipcMain.handle('get_capture_sources', async () => {
 });
 
 // IPC: authenticate
-ipcMain.handle('authenticate', async () => {
+ipcMain.handle('authenticate', async (_event, serverOrigin) => {
+  const origin = (serverOrigin || 'http://localhost:3001').replace(/\/+$/, '');
   return new Promise((resolve, reject) => {
     const server = net.createServer((socket) => {
       socket.on('data', (data) => {
@@ -128,7 +145,7 @@ ipcMain.handle('authenticate', async () => {
     });
 
     server.listen(13031, '127.0.0.1', () => {
-      shell.openExternal('https://fabricio.wibot.isroot.in/auth/desktop');
+      shell.openExternal(`${origin}/auth/desktop`);
       
       // Timeout de 2 min
       setTimeout(() => {
@@ -204,5 +221,37 @@ ipcMain.handle('get_window_height', async (event, hwndId) => {
   } catch (e) {
     console.error("Erro em get_window_height:", e);
     return 0;
+  }
+});
+
+// IPC: Video Capture Native
+ipcMain.handle('start_video_capture', async (event, options) => {
+  if (!videoCapture) return { success: false, error: 'Native module video_capture not loaded.' };
+  
+  return new Promise((resolve) => {
+    try {
+      videoCapture.startVideoCapture(options || {}, (data) => {
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('video-data', data);
+          }
+        } catch (err) {
+          console.error('[videoCapture] Error sending video-data:', err);
+        }
+      });
+      resolve({ success: true });
+    } catch (e) {
+      resolve({ success: false, error: e.message });
+    }
+  });
+});
+
+ipcMain.handle('stop_video_capture', async () => {
+  if (!videoCapture) return { success: false };
+  try {
+    videoCapture.stopVideoCapture();
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 });

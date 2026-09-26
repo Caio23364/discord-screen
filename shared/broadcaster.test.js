@@ -99,7 +99,7 @@ class StreamFalsa {
 let relogioDeCaptura = 0;
 
 /** Um quadro, do tamanho que o teste quiser. */
-const H264 = `vp8`;
+const H264 = 'avc1.64001f';
 
 const quadro = (
   displayWidth = 1280,

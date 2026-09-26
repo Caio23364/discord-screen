@@ -285,11 +285,14 @@ const run = async () => {
   check('sem senha entra direto de novo', voltouAberta.status === 200);
 
   // ===================================================================== relay
-  const sala = (await api('/api/rooms/create', { identity: alice.identity, name: 'Relay' })).body;
-  const bobNaSala = (await api('/api/rooms/join', { identity: bob.identity, roomId: sala.roomId }))
+  const charlie = await identity(CANAL_B, 'Charlie');
+  const diana = await identity(CANAL_B, 'Diana');
+  
+  const sala = (await api('/api/rooms/create', { identity: charlie.identity, name: 'Relay' })).body;
+  const bobNaSala = (await api('/api/rooms/join', { identity: diana.identity, roomId: sala.roomId }))
     .body;
 
-  const semSalaWs = await open(`${WSB}/ws?t=${encodeURIComponent(alice.identity)}`).catch(
+  const semSalaWs = await open(`${WSB}/ws?t=${encodeURIComponent(charlie.identity)}`).catch(
     () => null,
   );
   check('token de identidade nao abre WebSocket', semSalaWs === null);
@@ -300,7 +303,7 @@ const run = async () => {
     'viewer recebe state ao entrar',
     viewer.recv.json.some((m) => m.type === 'state'),
   );
-  check('state identifica a sala e o dono', lastState(viewer).room?.ownerId === alice.user.id);
+  check('state identifica a sala e o dono', lastState(viewer).room?.ownerId === charlie.user.id);
 
   const c1 = await openCaster(sala);
   await sleep(120);
@@ -401,11 +404,11 @@ const run = async () => {
   check('o outro slot continua chegando', binsOfSlot(viewer, slot2).length === 1);
 
   // -------------------------------------------------------------- apelido
-  viewer.send(JSON.stringify({ type: 'rename', name: '  Alice   Renomeada  ' }));
+  viewer.send(JSON.stringify({ type: 'rename', name: '  Charlie   Renomeado  ' }));
   await sleep(120);
   check(
     'rename normaliza espacos e propaga',
-    lastState(viewer).participants.some((p) => p.name === 'Alice Renomeada'),
+    lastState(viewer).participants.some((p) => p.name === 'Charlie Renomeado'),
   );
 
   viewer.send(JSON.stringify({ type: 'rename', name: 'x'.repeat(80) }));
@@ -416,7 +419,7 @@ const run = async () => {
   );
 
   // ----------------------------------------------------- isolamento de sala
-  const outraSala = (await api('/api/rooms/create', { identity: bob.identity, name: 'Outra' }))
+  const outraSala = (await api('/api/rooms/create', { identity: diana.identity, name: 'Outra' }))
     .body;
   const outroViewer = await openViewer(outraSala);
   await sleep(120);

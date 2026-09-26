@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
   
   const micToggleBtn = document.getElementById('mic-toggle-btn');
   const screenShareBtn = document.getElementById('screen-share-btn');
+  const censorBtn = document.getElementById('censor-btn');
   const fullscreenBtn = document.getElementById('fullscreen-btn');
   
   const qualitySelectorBtn = document.getElementById('quality-selector-btn');
@@ -24,7 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const debugRestartBtn = document.getElementById('debug-restart-btn');
 
   let selectedBitrate = 5_000_000;
-  let selectedFps = 60;
+  let selectedFps: number | string = 60;
   let selectedWidth = 1920;
   let selectedHeight = 1080;
   let autoBitrateEnabled = false;
@@ -36,7 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let activeStream: MediaStream | null = null;
   let activeBroadcaster: any = null;
   let isManualStop = false;
-  const SERVER_ORIGIN = 'https://fabricio.wibot.isroot.in';
+  const SERVER_ORIGIN = localStorage.getItem('server_origin') || 'http://localhost:3001';
 
   // Native Audio Ingestion
   let nativeAudioContext: AudioContext | null = null;
@@ -51,17 +52,28 @@ document.addEventListener('DOMContentLoaded', () => {
   let ringReadPos = 0;
   
   function pushToRingBuffer(chunk: Float32Array) {
-    for (let i = 0; i < chunk.length; i++) {
+    // Garante um número par de amostras para não inverter L e R
+    const safeLength = chunk.length - (chunk.length % 2);
+    for (let i = 0; i < safeLength; i += 2) {
       audioRingBuffer[ringWritePos] = chunk[i];
-      ringWritePos = (ringWritePos + 1) % RING_BUFFER_SIZE;
+      audioRingBuffer[ringWritePos + 1] = chunk[i + 1];
+      ringWritePos = (ringWritePos + 2) % RING_BUFFER_SIZE;
+      
       if (ringWritePos === ringReadPos) {
-        // Overflow: drop oldest samples
+        // Overflow: drop oldest stereo sample
         ringReadPos = (ringReadPos + 2) % RING_BUFFER_SIZE;
       }
     }
   }
 
   function readFromRingBuffer(outL: Float32Array, outR: Float32Array) {
+    // Compensação de drift: se o buffer acumular mais de 100ms (9600 amostras a 48kHz),
+    // adianta o ponteiro de leitura para manter o atraso em no máximo ~50ms
+    const buffered = (ringWritePos - ringReadPos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+    if (buffered > 9600) {
+      ringReadPos = (ringWritePos - 4800 + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+    }
+
     const framesToRead = outL.length;
     for (let i = 0; i < framesToRead; i++) {
       if (ringReadPos === ringWritePos) {
@@ -70,14 +82,8 @@ document.addEventListener('DOMContentLoaded', () => {
         outR[i] = 0;
       } else {
         outL[i] = audioRingBuffer[ringReadPos];
-        ringReadPos = (ringReadPos + 1) % RING_BUFFER_SIZE;
-        
-        if (ringReadPos === ringWritePos) {
-          outR[i] = 0;
-        } else {
-          outR[i] = audioRingBuffer[ringReadPos];
-          ringReadPos = (ringReadPos + 1) % RING_BUFFER_SIZE;
-        }
+        outR[i] = audioRingBuffer[ringReadPos + 1];
+        ringReadPos = (ringReadPos + 2) % RING_BUFFER_SIZE;
       }
     }
   }
@@ -190,18 +196,30 @@ document.addEventListener('DOMContentLoaded', () => {
     
     if (index === 0) {
       selectedBitrate = 15_000_000; selectedFps = 180; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = false; dsrEnabled = false;
     } else if (index === 1) {
       selectedBitrate = 2_500_000; selectedFps = 30; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = false; dsrEnabled = false;
     } else if (index === 2) {
       selectedBitrate = 5_000_000; selectedFps = 60; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = false; dsrEnabled = false;
     } else if (index === 3) {
       selectedBitrate = 4_000_000; selectedFps = 60; selectedWidth = 1280; selectedHeight = 720;
+      autoBitrateEnabled = false; dsrEnabled = false;
     } else if (index === 4) {
       selectedBitrate = 8_000_000; selectedFps = 60; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = false; dsrEnabled = false;
+    } else if (index === 5) {
+      selectedBitrate = 10_000_000; selectedFps = 60; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = false; dsrEnabled = false;
+    } else if (index === 6) {
+      selectedBitrate = 5_000_000; selectedFps = 'auto'; selectedWidth = 1920; selectedHeight = 1080;
+      autoBitrateEnabled = true; dsrEnabled = true;
     } else if (index === -1) {
       // Custom mode
       if (qualityDesc) qualityDesc.textContent = `Custom (${selectedWidth}x${selectedHeight})`;
       qualityItems.forEach(i => i.classList.remove('selected'));
+      autoBitrateEnabled = false; dsrEnabled = false;
     }
     
     if (activeBroadcaster) {
@@ -247,7 +265,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (idx === -1) {
       selectedWidth = parseInt(localStorage.getItem('custom_w') || '1280');
       selectedHeight = parseInt(localStorage.getItem('custom_h') || '720');
-      selectedFps = parseInt(localStorage.getItem('custom_fps') || '30');
+      
+      const savedFps = localStorage.getItem('custom_fps') || '30';
+      selectedFps = savedFps === 'auto' ? 'auto' : parseInt(savedFps);
+      
       selectedBitrate = parseFloat(localStorage.getItem('custom_bps') || '4') * 1_000_000;
       
       customW.value = selectedWidth.toString();
@@ -302,10 +323,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const electronAPI = (window as any).electronAPI || {
     getCaptureSources: () => Promise.resolve([]),
-    authenticate: () => Promise.reject('Electron não disponível'),
-    startAudioCapture: () => Promise.resolve({ success: false }),
+    authenticate: (_serverOrigin?: string) => Promise.reject('Electron não disponível'),
+    startAudioCapture: (_options?: any) => Promise.resolve({ success: false }),
+    stopAudioCapture: () => Promise.resolve({ success: true }),
+    getPidFromHwnd: (_hwndId: any) => Promise.resolve(0),
     getWindowHeight: () => Promise.resolve(0),
-    onAudioData: () => {}
+    onAudioData: () => {},
+    onToggleCensor: () => {}
   };
 
   electronAPI.onAudioData((data: any) => {
@@ -366,20 +390,54 @@ document.addEventListener('DOMContentLoaded', () => {
   function pararTransmissao() {
     isManualStop = true;
     if (activeBroadcaster) {
-      try { activeBroadcaster.stop(); } catch {}
+      activeBroadcaster.stop('Parado pelo usuário');
       activeBroadcaster = null;
     }
+    
+    // Parar capturas nativas
+    electronAPI.stopAudioCapture().catch(() => {});
+    electronAPI.stopVideoCapture().catch(() => {});
+    
+    if ((window as any)._onVideoDataRemover) {
+      (window as any)._onVideoDataRemover();
+      delete (window as any)._onVideoDataRemover;
+    }
+
     if (activeStream) {
       activeStream.getTracks().forEach(t => t.stop());
       activeStream = null;
     }
     electronAPI.stopAudioCapture();
+    
+    // Limpeza completa do Web Audio (BUG-01, BUG-03)
+    if (nativeAudioScriptNode) {
+      nativeAudioScriptNode.disconnect();
+      nativeAudioScriptNode = null;
+    }
+    if (nativeAudioDestination) {
+      nativeAudioDestination.disconnect();
+      nativeAudioDestination = null;
+    }
+    if (nativeAudioContext) {
+      nativeAudioContext.close().catch(() => {});
+      nativeAudioContext = null;
+    }
+    
     if (previewVideo) {
       previewVideo.srcObject = null;
     }
     emptyState?.classList.remove('hidden');
     if (appSubtitle) appSubtitle.textContent = 'Nenhuma tela selecionada';
     if (screenShareBtn) screenShareBtn.classList.remove('highlight');
+    if (censorBtn) {
+      censorBtn.style.display = 'none';
+      censorBtn.classList.remove('active');
+      isCensored = false;
+    }
+    
+    // Reset timer (BUG-16)
+    secondsElapsed = 0;
+    if (timerEl) timerEl.textContent = '00:00';
   }
 
   // Start Share / Login button
@@ -394,7 +452,7 @@ document.addEventListener('DOMContentLoaded', () => {
           startShareBtn.textContent = 'Autenticando...';
           startShareBtn.disabled = true;
           
-          const rawToken: string = await electronAPI.authenticate();
+          const rawToken: string = await electronAPI.authenticate(SERVER_ORIGIN);
           currentIdentityToken = decodeURIComponent(rawToken);
           localStorage.setItem('discord_identity_token', currentIdentityToken);
           console.log('[DEBUG] Token de Identidade recebido e salvo:', currentIdentityToken);
@@ -435,29 +493,38 @@ document.addEventListener('DOMContentLoaded', () => {
             pararTransmissao();
             isManualStop = false; // Reset the flag after stopping the previous one
 
-            // 1. Inicia a captura de tela nativa com áudio
-            console.log('[DEBUG] Solicitando getDisplayMedia...');
-            const stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                mandatory: {
-                  chromeMediaSource: 'desktop'
-                }
-              } as any,
-              video: {
-                mandatory: {
-                  chromeMediaSource: 'desktop',
-                  chromeMediaSourceId: source.id,
-                  maxFrameRate: selectedFps,
-                  maxWidth: selectedWidth,
-                  maxHeight: selectedHeight
-                }
-              } as any
-            });
-
-            // Start native WASAPI audio to replace or complement the browser one
-            let audioOptions: any = {};
+            // 1. Inicia a captura de tela
+            console.log('[DEBUG] Solicitando getUserMedia com source:', source.id);
+            
+            // 1. Obtém as permissões do sistema operacional para aquela janela/tela
+            let stream: MediaStream;
             
             if (source.kind === 'window') {
+              // Para janela usando nosso módulo nativo de captura N-API, precisamos de uma stream falsa
+              // apenas para alimentar a UI local e preencher o preview sem acionar o WebCodecs.
+              stream = new MediaStream();
+            } else {
+              stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  mandatory: {
+                    chromeMediaSource: 'desktop'
+                  }
+                } as any,
+                video: {
+                  mandatory: {
+                    chromeMediaSource: 'desktop',
+                    chromeMediaSourceId: source.id,
+                    maxFrameRate: typeof selectedFps === 'number' ? selectedFps : 60,
+                    maxWidth: selectedWidth,
+                    maxHeight: selectedHeight
+                  }
+                } as any
+              });
+            }
+
+            // Se for janela, usamos áudio nativo WASAPI isolado por processo
+            if (source.kind === 'window') {
+              let audioOptions: any = {};
               const pid = await electronAPI.getPidFromHwnd(source.id);
               if (pid && pid > 0) {
                 console.log(`[DEBUG] Capturando áudio especificamente do PID: ${pid}`);
@@ -466,16 +533,23 @@ document.addEventListener('DOMContentLoaded', () => {
               } else {
                 if (appSubtitle) appSubtitle.textContent = `Compartilhando: ${source.name} (PID FALHOU)`;
               }
-            }
-            await electronAPI.startAudioCapture(audioOptions);
+              await electronAPI.startAudioCapture(audioOptions);
 
-            // Se for janela, precisamos usar o áudio nativo em vez do desktop inteiro
-            if (source.kind === 'window') {
               console.log('[DEBUG] Substituindo áudio do sistema pelo áudio isolado nativo...');
               // Remove o áudio padrão do Chromium
               stream.getAudioTracks().forEach(t => {
                 t.stop();
                 stream.removeTrack(t);
+              });
+              
+              console.log('[DEBUG] Iniciando captura de vídeo acelerada por hardware N-API (DirectX 11 + MediaFoundation)...');
+              await electronAPI.startVideoCapture({
+                targetPid: pid,
+                maxWidth: selectedWidth,
+                maxHeight: selectedHeight,
+                fps: selectedFps,
+                bitrate: selectedBitrate,
+                cursor: true
               });
               
               ringWritePos = 0; // Limpa fila
@@ -490,7 +564,7 @@ document.addEventListener('DOMContentLoaded', () => {
               
               if (!nativeAudioDestination) {
                 nativeAudioDestination = nativeAudioContext.createMediaStreamDestination();
-                nativeAudioScriptNode = nativeAudioContext.createScriptProcessor(4096, 0, 2);
+                nativeAudioScriptNode = nativeAudioContext.createScriptProcessor(2048, 0, 2);
                 nativeAudioScriptNode.onaudioprocess = (e) => {
                   const outL = e.outputBuffer.getChannelData(0);
                   const outR = e.outputBuffer.getChannelData(1);
@@ -504,6 +578,10 @@ document.addEventListener('DOMContentLoaded', () => {
               if (nativeTrack) {
                 stream.addTrack(nativeTrack);
               }
+            } else {
+              // Se for captura de tela inteira, o Chromium já captura o áudio do sistema diretamente;
+              // Desliga qualquer captura WASAPI residual para não sobrecarregar IPC nem CPU
+              await electronAPI.stopAudioCapture();
             }
 
             activeStream = stream;
@@ -515,6 +593,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             emptyState?.classList.add('hidden');
             if (screenShareBtn) screenShareBtn.classList.add('highlight');
+            if (censorBtn) censorBtn.style.display = 'block';
 
             // 3. Conecta à sala no servidor Discord
             console.log('[DEBUG] Buscando sala no servidor:', `${SERVER_ORIGIN}/api/rooms/call`);
@@ -586,6 +665,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 maxHeight: selectedHeight,
                 autoBitrate: autoBitrateEnabled,
                 dsrEnabled: dsrEnabled,
+                nativeVideoSource: source.kind === 'window',
                 audio: true,
                 fonte: 'tela',
                 streamPronto: stream,
@@ -608,6 +688,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 onEnd: (reason: string) => {
                   console.log('[DEBUG] Broadcaster encerrou:', reason);
                   if (!isManualStop && currentSelectedSource) {
+                    // Evitar loop de reconexão infinita se cair rápido demais (BUG-10)
+                    const timeAlive = Date.now() - activeBroadcaster.startedAt;
+                    if (timeAlive < 5000) {
+                      console.warn('[DEBUG] Conexão caiu rápido demais. Abortando auto-reconnect.');
+                      pararTransmissao();
+                      if (appSubtitle) appSubtitle.textContent = 'Conexão falhou repetidamente';
+                      return;
+                    }
+                    
                     console.log('[DEBUG] Conexão perdida. Tentando auto-reconnect silencioso em 3s...');
                     setTimeout(() => {
                       if (!isManualStop) {
@@ -637,6 +726,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('[DEBUG] Compartilhamento encerrado pelo usuário no SO.');
                 pararTransmissao();
               });
+
+              if (source.kind === 'window') {
+                // Inscreve a recepção nativa de NALUs para injetar direto no WebSockets via Broadcaster
+                (window as any)._onVideoDataRemover = electronAPI.onVideoData((buffer: Uint8Array) => {
+                  if (activeBroadcaster && typeof activeBroadcaster.injectNativeNalu === 'function') {
+                    activeBroadcaster.injectNativeNalu(buffer);
+                  }
+                });
+              }
 
             } else {
               console.error('[DEBUG] Não foi possível obter uma URL de sala válida.');
@@ -703,6 +801,33 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  let isCensored = false;
+  censorBtn?.addEventListener('click', () => {
+    isCensored = !isCensored;
+    censorBtn.classList.toggle('active', isCensored);
+    const icon = censorBtn.querySelector('i');
+    if (icon) {
+      if (isCensored) {
+        icon.classList.remove('fa-eye-slash');
+        icon.classList.add('fa-eye');
+        censorBtn.classList.replace('danger-action', 'primary-action');
+      } else {
+        icon.classList.remove('fa-eye');
+        icon.classList.add('fa-eye-slash');
+        censorBtn.classList.replace('primary-action', 'danger-action');
+      }
+    }
+    if (activeBroadcaster) {
+      activeBroadcaster.toggleCensor(isCensored);
+    }
+  });
+
+  if ((window as any).electronAPI?.onToggleCensor) {
+    (window as any).electronAPI.onToggleCensor(() => {
+      censorBtn?.click();
+    });
+  }
+
   // Fullscreen button
   fullscreenBtn?.addEventListener('click', async () => {
     if (!document.fullscreenElement) {
@@ -757,6 +882,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let secondsElapsed = 0;
   const timerEl = document.getElementById('session-timer');
   setInterval(() => {
+    if (!activeStream) return; // (BUG-16) Timer só roda se a transmissão estiver ativa
     secondsElapsed++;
     const m = Math.floor(secondsElapsed / 60).toString().padStart(2, '0');
     const s = (secondsElapsed % 60).toString().padStart(2, '0');

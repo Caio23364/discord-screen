@@ -1,7 +1,7 @@
 import { DiscordSDK } from '@discord/embedded-app-sdk';
 import { createPlayer } from './player.js';
 import { createAudio } from './audio.js';
-import { createBroadcaster } from '../../shared/broadcaster.js';
+import { createBroadcaster } from '@shared/broadcaster.js';
 import {
   iceServers,
   criarPeer,
@@ -9,14 +9,14 @@ import {
   resumoPeer,
   MORTO,
   PRAZO_CONEXAO_MS,
-} from '../../shared/rtc.js';
+} from '@shared/rtc.js';
 
 const $ = (id) => document.getElementById(id);
 
 const params = new URLSearchParams(location.search);
 // O Discord injeta frame_id/instance_id na URL do iframe. Sem eles, estamos
 // rodando direto no navegador — modo de desenvolvimento.
-const inDiscord = params.has('frame_id');
+const inDiscord = params.has('frame_id') && window.parent !== window;
 
 // Dentro da Activity todo tráfego precisa passar pelo proxy do Discord.
 const P = inDiscord ? '/.proxy' : '';
@@ -26,6 +26,23 @@ const P = inDiscord ? '/.proxy' : '';
 // dentro do tile de cada pessoa — detachar não apaga o conteúdo nem invalida o
 // contexto 2D, então os decoders seguem desenhando sem saber de nada.
 const streams = new Map(); // slot -> { userId, canvas, player }
+
+// Cache de DOM para evitar Layout Thrashing
+const tileCache = new Map(); // key -> { stateStr, el, slot }
+
+function patchChildren(container, newNodes) {
+  const existing = Array.from(container.childNodes);
+  const newSet = new Set(newNodes);
+  for (const node of existing) {
+    if (!newSet.has(node)) node.remove();
+  }
+  let i = 0;
+  for (const node of newNodes) {
+    const current = container.childNodes[i];
+    if (current !== node) container.insertBefore(node, current || null);
+    i++;
+  }
+}
 
 // Transmissões anunciadas pelo servidor, assistidas ou não. Assistir é opt-in:
 // sem pedir, o servidor nem envia os quadros — a economia de banda depende
@@ -51,6 +68,22 @@ let myBroadcast = null;
 // Zero é o mudo — um número só, em vez de dois estados que precisam concordar.
 let volume = Math.min(1, Math.max(0, Number(read('volume') ?? 1)));
 let fsrEnabled = read('fsrEnabled') === 'true';
+let fsrStrength = Number(read('fsrStrength') ?? 1.5);
+let fsrSaturation = Number(read('fsrSaturation') ?? 1.0);
+let showPings = read('showPings') !== 'false';
+let allowZoom = read('allowZoom') === 'true';
+
+if ($('fsrSwitch')) $('fsrSwitch').checked = fsrEnabled;
+if ($('fsrStrength')) {
+  $('fsrStrength').value = fsrStrength;
+  if ($('fsrStrengthVal')) $('fsrStrengthVal').innerText = fsrStrength.toFixed(1);
+}
+if ($('fsrSaturation')) {
+  $('fsrSaturation').value = fsrSaturation;
+  if ($('fsrSaturationVal')) $('fsrSaturationVal').innerText = fsrSaturation.toFixed(1);
+}
+if ($('showPingsSwitch')) $('showPingsSwitch').checked = showPings;
+if ($('allowZoomSwitch')) $('allowZoomSwitch').checked = allowZoom;
 
 /**
  * Volume de cada pessoa, separado do volume geral.
@@ -90,11 +123,15 @@ function applyFSR() {
     btn.dataset.tip = fsrEnabled ? 'Desligar FSR/Nitidez' : 'Ligar FSR/Nitidez';
     btn.setAttribute('aria-label', btn.dataset.tip);
   }
+  
+  let hasWebGL = false;
   for (const s of streams.values()) {
-    if (s.player && s.player.setFSR) {
-      s.player.setFSR(fsrEnabled);
+    if (s.player && s.player.setVideoSettings) {
+      if (s.player.isWebGL) hasWebGL = true;
+      s.player.setVideoSettings({ fsrEnabled, fsrStrength, saturation: fsrSaturation });
     }
   }
+  if ($('fsrBox')) $('fsrBox').hidden = !hasWebGL || activeSlot === null;
 }
 // Para onde o botão de silenciar volta. Sem isto, desmutar cairia sempre em
 // 100%, ignorando o ajuste que a pessoa tinha feito.
@@ -295,6 +332,7 @@ function renderGrid() {
     grid.hidden = true;
     $('empty').hidden = true;
     $('fullscreen').hidden = true;
+    if ($('pipBtn')) $('pipBtn').hidden = true;
     $('watchSite').hidden = true;
     $('app').classList.remove('cheia', 'flutua', 'palco');
     return;
@@ -350,6 +388,7 @@ function renderGrid() {
 
   const noPalco = activeSlot !== null;
   $('fullscreen').hidden = !noPalco;
+  if ($('pipBtn')) $('pipBtn').hidden = inDiscord || !noPalco;
   // A classe vai no #app, e não na grade: quem sai do layout são as barras, que
   // são irmãs dela. Fica acima do `return` de sala vazia — senão as barras
   // continuariam flutuando sobre o painel de "ninguém na sala".
@@ -375,6 +414,7 @@ function renderGrid() {
   // tile — dois caminhos, um lugar só para avisar.
   const podeIrAoSite = inDiscord && noPalco && Boolean(origemDoSite());
   $('watchSite').hidden = !podeIrAoSite;
+  applyFSR();
   if ($('fsrToggle')) $('fsrToggle').hidden = !noPalco;
 
   if (!hasPeople) return;
@@ -387,13 +427,10 @@ function renderGrid() {
   // barra de cima se recolhe sozinha.
   $('people').hidden = noPalco && !telaCheia;
 
-  // Os canvas são reanexados abaixo; removê-los daqui não perde o conteúdo.
-  grid.replaceChildren();
-
   if (!noPalco) {
     const entradas = entradasDoGrid();
     grid.style.setProperty('--cols', columnsFor(entradas.length));
-    grid.append(...entradas.map((e) => buildTile(e.p, { slot: e.slot }).el));
+    patchChildren(grid, entradas.map((e) => getCachedTile(e.p, { slot: e.slot })));
     return;
   }
 
@@ -403,16 +440,31 @@ function renderGrid() {
     name: 'Transmitindo',
     broadcasting: true,
   };
-  // O slot em destaque, e não o da pessoa: cada transmissão tem um nó de canvas
-  // só, então montar o palco com o slot errado o arranca do tile que o estava
-  // mostrando — e um dos dois fica preto, conforme a ordem do desenho.
-  grid.append(buildTile(emCena, { palco: true, slot: activeSlot }).el);
+  
+  const childNodes = [getCachedTile(emCena, { palco: true, slot: activeSlot })];
 
-  if (telaCheia) return;
-
-  applyStrip();
-  grid.append(divider, buildSidebar());
+  if (!telaCheia) {
+    applyStrip();
+    childNodes.push(divider, buildSidebar());
+  }
+  
+  patchChildren(grid, childNodes);
 }
+
+const barra = document.createElement('aside');
+barra.className = 'sidebar';
+const barraTitle = document.createElement('h2');
+barraTitle.className = 'sidebar-title';
+const barraGente = document.createElement('div');
+barraGente.className = 'sidebar-people';
+const barraCount = document.createElement('div');
+barraCount.className = 'sidebar-count';
+const barraCountText = document.createTextNode('');
+barraCount.innerHTML =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 20v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>' +
+  '<circle cx="9" cy="7" r="4"/><path d="M23 20v-2a4 4 0 0 0-3-3.87"/>' +
+  '<path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>';
+barraCount.append(barraCountText);
 
 /**
  * Barra lateral: as outras telas em cima, as pessoas embaixo.
@@ -422,54 +474,73 @@ function renderGrid() {
  * como linha, que cabe muito mais gente no mesmo espaço.
  */
 function buildSidebar() {
-  const barra = document.createElement('aside');
-  barra.className = 'sidebar';
+  const nodes = [];
 
   // Por transmissão, e não por pessoa: quem divide tela e câmera tem duas
   // miniaturas aqui, e a que está no palco é a única que não se repete.
   const outras = entradasDoGrid().filter((e) => e.slot !== null && e.slot !== activeSlot);
   if (outras.length) {
-    barra.append(secaoTitulo(outras.length === 1 ? 'Outra transmissão' : 'Outras transmissões'));
-    for (const e of outras) barra.append(buildTile(e.p, { slot: e.slot }).el);
+    barraTitle.textContent = outras.length === 1 ? 'Outra transmissão' : 'Outras transmissões';
+    nodes.push(barraTitle);
+    for (const e of outras) nodes.push(getCachedTile(e.p, { slot: e.slot }));
   }
 
-  barra.append(contagemPessoas());
+  barraCountText.nodeValue = String(participants.length);
+  barraCount.title = participants.length === 1 ? '1 pessoa na sala' : `${participants.length} pessoas na sala`;
+  nodes.push(barraCount);
 
-  // semVideo é obrigatório aqui: o canvas de cada transmissão é um nó de DOM
-  // só, e anexá-lo neste tile o arrancaria do palco — que ficaria preto
-  // enquanto a miniatura ao lado mostrava a tela.
-  const gente = document.createElement('div');
-  gente.className = 'sidebar-people';
-  for (const p of participants) gente.append(buildTile(p, { semVideo: true }).el);
-  barra.append(gente);
+  // Pessoas
+  patchChildren(barraGente, participants.map(p => getCachedTile(p, { semVideo: true })));
+  nodes.push(barraGente);
 
+  patchChildren(barra, nodes);
   return barra;
 }
 
-function secaoTitulo(texto) {
-  const t = document.createElement('h2');
-  t.className = 'sidebar-title';
-  t.textContent = texto;
-  return t;
-}
+function getCachedTile(p, options = {}) {
+  const { palco = false, semVideo = false, slot: slotDado = null } = options;
+  const slot = p.broadcasting && !semVideo ? slotDado : null;
+  const stream = slot !== null ? streams.get(slot) : null;
+  const isMe = p.id === session?.user?.id;
+  const avail = slot !== null ? available.get(slot) : null;
+  
+  const state = {
+    palco, semVideo, slot, isMe,
+    p_name: p.name,
+    p_broadcasting: p.broadcasting,
+    p_avatar: p.avatar,
+    stream_started: stream?.started,
+    stream_w: stream ? (stream.viaRtc ? stream.video?.videoWidth : stream.canvas?.width) : null,
+    stream_h: stream ? (stream.viaRtc ? stream.video?.videoHeight : stream.canvas?.height) : null,
+    zoom: stream?.zoom,
+    panX: stream?.panX,
+    panY: stream?.panY,
+    watchers: avail?.watchers?.map(w => w.id).join(',') || '',
+    fonte: avail?.fonte || '',
+    watching: slot !== null ? watching.has(slot) : false,
+    telaCheia
+  };
+  const stateStr = JSON.stringify(state);
+  const cacheKey = `${p.id}-${slot}-${palco}-${semVideo}`;
 
-/**
- * Quantas pessoas na sala, na mesma pílula usada no resto da interface.
- *
- * Era um título em caixa alta, que gastava uma faixa inteira da lateral para
- * dizer o que um número diz — e a lateral é justamente onde falta espaço.
- */
-function contagemPessoas() {
-  const chip = document.createElement('div');
-  chip.className = 'sidebar-count';
-  chip.innerHTML =
-    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 20v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>' +
-    '<circle cx="9" cy="7" r="4"/><path d="M23 20v-2a4 4 0 0 0-3-3.87"/>' +
-    '<path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>';
-  chip.append(document.createTextNode(String(participants.length)));
-  chip.title =
-    participants.length === 1 ? '1 pessoa na sala' : `${participants.length} pessoas na sala`;
-  return chip;
+  let cached = tileCache.get(cacheKey);
+  if (cached && cached.stateStr === stateStr) {
+    // Reanexa o nó de mídia caso tenha se perdido ou mudado
+    if (stream) {
+      const node = noDe(stream);
+      if (node && node.parentNode !== cached.el) {
+        // Encontra onde ele deve entrar (logo no início, após span se houver)
+        const oldNode = cached.el.querySelector('canvas, video');
+        if (oldNode) oldNode.replaceWith(node);
+        else cached.el.prepend(node);
+      }
+    }
+    return cached.el;
+  }
+  
+  const result = buildTile(p, options);
+  tileCache.set(cacheKey, { stateStr, el: result.el, slot: result.slot });
+  return result.el;
 }
 
 /**
@@ -493,6 +564,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   const tile = document.createElement('div');
   tile.className = p.broadcasting ? 'tile sharing' : 'tile';
   if (palco) tile.classList.add('tile-palco');
+  if (slot !== null) tile.dataset.slot = slot;
 
   // Com a forma do vídeo no próprio tile, a moldura passa a abraçar a imagem.
   // Sem isto, uma tela 16:9 dentro de um palco largo e baixo encolhia até caber
@@ -511,7 +583,43 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
     tile.append(marca);
   }
 
-  const aoClicar = () => {
+  let hasDragged = false;
+
+  const aoClicar = (e) => {
+    if (hasDragged) { hasDragged = false; return; }
+    if (slot !== null && watching.has(slot) && stream?.canvas) {
+      const rect = stream.canvas.getBoundingClientRect();
+      const elW = rect.width;
+      const elH = rect.height;
+      const vidW = stream.canvas.width;
+      const vidH = stream.canvas.height;
+      if (vidW && vidH) {
+        const elAspect = elW / elH;
+        const vidAspect = vidW / vidH;
+        let drawW = elW, drawH = elH, offX = 0, offY = 0;
+        if (elAspect > vidAspect) {
+          drawW = elH * vidAspect;
+          offX = (elW - drawW) / 2;
+        } else if (elAspect < vidAspect) {
+          drawH = elW / vidAspect;
+          offY = (elH - drawH) / 2;
+        }
+        const clickX = e.clientX - rect.left - offX;
+        const clickY = e.clientY - rect.top - offY;
+        if (clickX >= 0 && clickX <= drawW && clickY >= 0 && clickY <= drawH) {
+          if (stream.zoom > 1) return; // Prevent inaccurate pings when zoomed
+          if (showPings && palco) {
+            ws?.send(JSON.stringify({ type: 'ping', slot, x: clickX / drawW, y: clickY / drawH }));
+            return;
+          }
+        }
+      }
+    }
+    if (palco) telaCheia = !telaCheia;
+    else activeSlot = slot;
+    renderGrid();
+  };
+  const aoDblClick = (_e) => {
     if (palco) telaCheia = !telaCheia;
     else activeSlot = slot;
     renderGrid();
@@ -525,6 +633,53 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
         : 'Clique para ver em tela cheia'
       : 'Clique para ver em destaque';
     tile.addEventListener('click', aoClicar);
+    tile.addEventListener('wheel', (e) => {
+      if (!allowZoom || !stream || slot === null || activeSlot !== slot) return;
+      e.preventDefault();
+      const zoomFactor = 0.1;
+      stream.zoom += e.deltaY < 0 ? zoomFactor : -zoomFactor;
+      stream.zoom = Math.max(1, Math.min(stream.zoom, 5)); // limits
+      
+      if (stream.zoom === 1) {
+        stream.panX = 0;
+        stream.panY = 0;
+      }
+      stream.canvas.style.transform = `scale(${stream.zoom}) translate(${stream.panX}px, ${stream.panY}px)`;
+      stream.canvas.style.transformOrigin = 'center center';
+    }, { passive: false });
+
+    let isPanning = false;
+    let startX, startY;
+    tile.addEventListener('pointerdown', (e) => {
+      hasDragged = false;
+      if (!allowZoom || !stream || stream.zoom <= 1 || slot === null || activeSlot !== slot) return;
+      // Only pan on left click or touch
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      isPanning = true;
+      startX = e.clientX - stream.panX * stream.zoom;
+      startY = e.clientY - stream.panY * stream.zoom;
+      tile.setPointerCapture(e.pointerId);
+    });
+    tile.addEventListener('pointermove', (e) => {
+      if (!isPanning || !stream) return;
+      hasDragged = true;
+      stream.panX = (e.clientX - startX) / stream.zoom;
+      stream.panY = (e.clientY - startY) / stream.zoom;
+      stream.canvas.style.transform = `scale(${stream.zoom}) translate(${stream.panX}px, ${stream.panY}px)`;
+    });
+    tile.addEventListener('pointerup', (e) => {
+      if (isPanning) {
+        isPanning = false;
+        tile.releasePointerCapture(e.pointerId);
+      }
+    });
+    tile.addEventListener('pointercancel', (e) => {
+      if (isPanning) {
+        isPanning = false;
+        tile.releasePointerCapture(e.pointerId);
+      }
+    });
+    tile.addEventListener('dblclick', aoDblClick);
     // Botão direito para largar a tela, sem precisar caçar controle.
     tile.addEventListener('contextmenu', (e) => {
       e.preventDefault();
@@ -951,6 +1106,9 @@ function openStream(slot, userId) {
     // Vira true no primeiro quadro desenhado. Até lá o tile mostra "Conectando…"
     // em vez de uma caixa preta que não se distingue de um travamento.
     started: false,
+    zoom: 1,
+    panX: 0,
+    panY: 0,
     player: createPlayer(canvas, {
       onError: (m) => toast(m, true),
       onTamanho: () => {
@@ -1258,7 +1416,9 @@ window.addEventListener('keydown', (e) => {
 
 // ------------------------------------------------------------------- arranque
 
+let vigia;
 boot().catch((err) => {
+  clearTimeout(vigia);
   console.error(err);
   setEmpty('Não foi possível entrar', err.message);
 });
@@ -1267,7 +1427,7 @@ async function boot() {
   // O painel inicial é estático. Sem este vigia, qualquer espera que não
   // termine fica com a cara de "Conectando…" para sempre, sem dizer o que
   // está faltando — que foi exatamente como este arranque ja travou.
-  const vigia = setTimeout(() => {
+  vigia = setTimeout(() => {
     setEmpty('Está demorando…', 'Sem resposta do servidor. Ele está no ar?');
   }, 8000);
 
@@ -1360,6 +1520,18 @@ $('loginBtn').addEventListener('click', () => {
   // antiga, então as salas criadas como convidado ficam sem dono.
   remove('identity');
   location.href = '/auth/login';
+});
+
+$('downloadBtn').addEventListener('click', () => {
+  if (!session || session.isGuest) return;
+  const url = `${P}/download?identity=${encodeURIComponent(session.identity)}`;
+  if (inDiscord && sdk?.commands?.openExternalLink) {
+    sdk.commands.openExternalLink({ url: new URL(url, location.origin).href }).catch(() => {
+      window.open(url, '_blank');
+    });
+  } else {
+    window.open(url, '_blank');
+  }
 });
 
 /**
@@ -1502,11 +1674,13 @@ async function showLobby() {
   // O dock inteiro sai de cena: todo controle dele é de dentro da sala, e o
   // cabeçalho do lobby já traz perfil e criar sala.
   $('fullscreen').hidden = true;
+    if ($('pipBtn')) $('pipBtn').hidden = true;
   $('panel').hidden = true;
 
   // O login só aparece para convidado: quem já entrou pelo Discord não tem o
   // que melhorar.
   $('loginBtn').hidden = inDiscord || !session?.isGuest;
+  $('downloadBtn').hidden = !session || session.isGuest;
   $('people').hidden = true;
 
   await loadRooms();
@@ -1873,7 +2047,7 @@ function connect() {
   if (!roomTokens) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(
-    `${proto}://${location.host}${P}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}`,
+    `${proto}://${location.host}${P}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}&env=${inDiscord ? 'discord' : 'browser'}`,
   );
   ws.binaryType = 'arraybuffer';
 
@@ -1921,6 +2095,7 @@ function connect() {
     }
 
     if (msg.type === 'state') {
+      console.log('WS MSG:', msg.type, 'participants:', msg.participants?.length, 'streams:', msg.streams?.length);
       participants = msg.participants ?? [];
       abas.clear();
       for (const uid of msg.abas ?? []) abas.add(uid);
@@ -1948,6 +2123,15 @@ function connect() {
       for (const slot of [...available.keys()]) if (!live.has(slot)) available.delete(slot);
       for (const slot of [...streams.keys()]) if (!live.has(slot)) closeStream(slot);
       for (const slot of [...watching]) if (!live.has(slot)) watching.delete(slot);
+
+      // Poda tiles órfãos: quem saiu da sala não volta, e o DOM node desanexado
+      // ficaria preso no Map para sempre. A chave começa com o id do participante.
+      const pids = new Set(participants.map((p) => p.id));
+      for (const key of tileCache.keys()) {
+        const uid = key.slice(0, key.indexOf('-'));
+        if (!pids.has(uid)) tileCache.delete(key);
+      }
+
       renderGrid();
       renderBar();
     } else if (msg.type === 'stream-start') {
@@ -1990,6 +2174,54 @@ function connect() {
       }
     } else if (msg.type === 'error') {
       toast(msg.message, true);
+    } else if (msg.type === 'ping') {
+      if (!showPings) return;
+      const tile = document.querySelector(`.tile[data-slot="${msg.slot}"]`);
+      if (tile) {
+        const pingEl = document.createElement('div');
+        pingEl.className = 'ping-marker';
+        pingEl.style.left = `${msg.x * 100}%`;
+        pingEl.style.top = `${msg.y * 100}%`;
+        
+        const pingUserId = msg.user ? msg.user.id : msg.userId;
+        const p = participants.find(part => part.id === pingUserId);
+        if (p) {
+          const initials = p.name.split(/\s+/).slice(0, 2).map(w => [...w][0] ?? '').join('').toUpperCase();
+          pingEl.textContent = initials;
+          pingEl.style.backgroundColor = p.id === window.myUserId ? 'var(--discord-blurple)' : 'var(--danger)';
+        }
+        
+        const stream = streams.get(msg.slot);
+        if (stream && stream.canvas) {
+          const rect = stream.canvas.getBoundingClientRect();
+          const elW = rect.width;
+          const elH = rect.height;
+          const vidW = stream.canvas.width;
+          const vidH = stream.canvas.height;
+          if (vidW && vidH) {
+            const elAspect = elW / elH;
+            const vidAspect = vidW / vidH;
+            let drawW = elW, drawH = elH, offX = 0, offY = 0;
+            if (elAspect > vidAspect) {
+              drawW = elH * vidAspect;
+              offX = (elW - drawW) / 2;
+            } else if (elAspect < vidAspect) {
+              drawH = elW / vidAspect;
+              offY = (elH - drawH) / 2;
+            }
+            pingEl.style.left = `${offX + (msg.x * drawW)}px`;
+            pingEl.style.top = `${offY + (msg.y * drawH)}px`;
+          }
+        }
+        
+        tile.appendChild(pingEl);
+        
+        setTimeout(() => {
+          pingEl.style.opacity = '0';
+          pingEl.style.transform = 'translate(-50%, -50%) scale(1.5)';
+          setTimeout(() => pingEl.remove(), 400);
+        }, 1500);
+      }
     }
   });
 
@@ -2529,3 +2761,81 @@ $('fsrToggle')?.addEventListener('click', () => {
   applyFSR();
 });
 
+$('fsrSwitch')?.addEventListener('change', (e) => {
+  fsrEnabled = e.target.checked;
+  store('fsrEnabled', fsrEnabled ? 'true' : 'false');
+  applyFSR();
+});
+
+$('fsrStrength')?.addEventListener('input', (e) => {
+  fsrStrength = Number(e.target.value);
+  store('fsrStrength', fsrStrength);
+  if ($('fsrStrengthVal')) $('fsrStrengthVal').innerText = fsrStrength.toFixed(1);
+  applyFSR();
+});
+
+$('fsrSaturation')?.addEventListener('input', (e) => {
+  fsrSaturation = Number(e.target.value);
+  store('fsrSaturation', fsrSaturation);
+  if ($('fsrSaturationVal')) $('fsrSaturationVal').innerText = fsrSaturation.toFixed(1);
+  applyFSR();
+});
+
+$('showPingsSwitch')?.addEventListener('change', (e) => {
+  showPings = e.target.checked;
+  store('showPings', showPings ? 'true' : 'false');
+});
+
+$('allowZoomSwitch')?.addEventListener('change', (e) => {
+  allowZoom = e.target.checked;
+  store('allowZoom', allowZoom ? 'true' : 'false');
+});
+
+
+let pipVideoFallback = null;
+$('pipBtn')?.addEventListener('click', async () => {
+  if (activeSlot === null) return;
+  const stream = streams.get(activeSlot);
+  if (!stream || !stream.canvas) return;
+
+  try {
+    if ('documentPictureInPicture' in window) {
+      const pipWindow = await window.documentPictureInPicture.requestWindow({
+        width: Math.max(800, stream.canvas.width / 2),
+        height: Math.max(450, stream.canvas.height / 2),
+      });
+      const originalParent = stream.canvas.parentNode;
+      
+      const pipStyle = document.createElement('style');
+      pipStyle.textContent = `
+        body { margin: 0; background: black; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+      `;
+      pipWindow.document.head.appendChild(pipStyle);
+      pipWindow.document.body.appendChild(stream.canvas);
+      
+      pipWindow.addEventListener('pagehide', () => {
+        if (originalParent) originalParent.appendChild(stream.canvas);
+      });
+    } else if (document.pictureInPictureEnabled) {
+      if (!pipVideoFallback) {
+        pipVideoFallback = document.createElement('video');
+        pipVideoFallback.style.display = 'none';
+        pipVideoFallback.muted = true;
+        document.body.appendChild(pipVideoFallback);
+      }
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+      }
+      const mediaStream = stream.canvas.captureStream(60);
+      pipVideoFallback.srcObject = mediaStream;
+      await pipVideoFallback.play();
+      await pipVideoFallback.requestPictureInPicture();
+    } else {
+      toast('Picture-in-Picture não é suportado.', true);
+    }
+  } catch (err) {
+    toast('Erro PiP: ' + err.message, true);
+  }
+});

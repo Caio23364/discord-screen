@@ -558,7 +558,7 @@ describe('pushChunk', () => {
     }
 
     it('descarta o delta de quem não vaza a fila', () => {
-      const { room, entry, lento } = entupido(600 * 1024);
+      const { room, entry, lento } = entupido(4.5 * 1024 * 1024);
       lento.__primed.add(entry.slot);
 
       R.pushChunk(room, entry, quadro(entry.slot, DELTA));
@@ -568,7 +568,7 @@ describe('pushChunk', () => {
     });
 
     it('descarta o áudio pelo mesmo teto', () => {
-      const { room, entry, lento } = entupido(600 * 1024);
+      const { room, entry, lento } = entupido(4.5 * 1024 * 1024);
 
       R.pushChunk(room, entry, quadro(entry.slot, AUDIO));
 
@@ -577,7 +577,7 @@ describe('pushChunk', () => {
     });
 
     it('dá ao keyframe o dobro de folga, porque sem ele a tela não volta', () => {
-      const { room, entry, lento } = entupido(600 * 1024);
+      const { room, entry, lento } = entupido(4.5 * 1024 * 1024);
 
       R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
 
@@ -585,7 +585,7 @@ describe('pushChunk', () => {
     });
 
     it('mas nem o keyframe passa quando a fila estourou de vez', () => {
-      const { room, entry, lento } = entupido(1200 * 1024);
+      const { room, entry, lento } = entupido(9 * 1024 * 1024);
 
       R.pushChunk(room, entry, quadro(entry.slot, KEYFRAME));
 

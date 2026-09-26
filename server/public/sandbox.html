@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <title>Discord Activity Sandbox Simulator</title>
+  <style>
+    body { background: #36393f; color: white; font-family: sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+    #container { flex: 1; border: 2px dashed #7289da; border-radius: 8px; overflow: hidden; position: relative; }
+    iframe { width: 100%; height: 100%; border: none; }
+    .logs { height: 200px; overflow-y: auto; background: #202225; padding: 10px; margin-top: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Simulador de Sandbox do Discord</h2>
+  <p>Esta página embute a aplicação num iframe SEM o atributo <code>allow="display-capture"</code>, forçando a restrição do Discord, e simula o backend do cliente do Discord respondendo aos eventos do SDK.</p>
+  
+  <div id="container">
+    <iframe id="app-frame" src="about:blank"></iframe>
+  </div>
+
+  <div class="logs" id="logs"></div>
+
+  <script>
+    const logs = document.getElementById('logs');
+    function log(msg) {
+      const div = document.createElement('div');
+      div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logs.appendChild(div);
+      logs.scrollTop = logs.scrollHeight;
+    }
+
+    const frame = document.getElementById('app-frame');
+    const urlParams = new URLSearchParams(window.location.search);
+    const instId = urlParams.get('instance') || `sandbox-${Math.random().toString(36).slice(2, 8)}`;
+    frame.src = `/?frame_id=simulated-sandbox-1234&client_id=123456789012345678&instance_id=${instId}&platform=desktop`;
+    
+    // Intercept messages from the iframe (Discord SDK)
+    window.addEventListener('message', (event) => {
+      // Ignore if not from our iframe
+      if (event.source !== frame.contentWindow) return;
+      
+      log(`Recebido: ${JSON.stringify(event.data)}`);
+      
+      const payload = event.data;
+      if (!Array.isArray(payload) || payload.length !== 2) return;
+      
+      const [opcode, data] = payload;
+
+      // Opcode 0 = Handshake. We must reply with READY dispatch
+      if (opcode === 0) {
+        log('Recebido Handshake. Respondendo com READY...');
+        frame.contentWindow.postMessage([
+          1, // Opcode 1 = Frame (Dispatch/Command)
+          {
+            cmd: 'DISPATCH',
+            evt: 'READY',
+            nonce: '',
+            data: {
+              v: 1,
+              config: { 
+                environment: 'production',
+                api_endpoint: '//' + (window.location.host || 'localhost:3001')
+              }
+            }
+          }
+        ], '*');
+      }
+
+      // Opcode 1 = Frame. Check for AUTHORIZE
+      if (opcode === 1 && data && data.cmd === 'AUTHORIZE') {
+        log(`Mocking AUTHORIZE response for nonce ${data.nonce}`);
+        frame.contentWindow.postMessage([
+          1, 
+          { 
+            cmd: 'AUTHORIZE', 
+            evt: null, 
+            data: { code: 'fake-oauth-code' }, 
+            nonce: data.nonce 
+          }
+        ], '*');
+      }
+
+      // Opcode 1 = Frame. Check for AUTHENTICATE
+      if (opcode === 1 && data && data.cmd === 'AUTHENTICATE') {
+        log(`Mocking AUTHENTICATE response for nonce ${data.nonce}`);
+        frame.contentWindow.postMessage([
+          1, 
+          { 
+            cmd: 'AUTHENTICATE', 
+            evt: null, 
+            data: { 
+              access_token: data.args.access_token,
+              user: {
+                username: 'playwright_tester',
+                discriminator: '0',
+                id: '123456789012345678',
+                avatar: null,
+                public_flags: 0
+              },
+              scopes: ['identify', 'guilds'],
+              expires: new Date(Date.now() + 3600000).toISOString(),
+              application: {
+                description: '',
+                icon: null,
+                id: '123456789012345678',
+                name: 'Playwright Sandbox'
+              }
+            }, 
+            nonce: data.nonce 
+          }
+        ], '*');
+      }
+
+      // Opcode 1 = Frame. Check for OPEN_EXTERNAL_LINK
+      if (opcode === 1 && data && data.cmd === 'OPEN_EXTERNAL_LINK') {
+        log(`Mocking OPEN_EXTERNAL_LINK response for nonce ${data.nonce}, url: ${data.args.url}`);
+        
+        // Abre de verdade no navegador pai para o Playwright capturar o evento de popup
+        window.open(data.args.url, '_blank');
+        
+        frame.contentWindow.postMessage([
+          1, 
+          { 
+            cmd: 'OPEN_EXTERNAL_LINK', 
+            evt: null, 
+            data: { opened: true }, 
+            nonce: data.nonce 
+          }
+        ], '*');
+      }
+    });
+
+    frame.onload = () => {
+      // Simula a remoção da permissão do getDisplayMedia que ocorre em iframes cross-origin
+      if (frame.contentWindow.navigator.mediaDevices) {
+        frame.contentWindow.navigator.mediaDevices.getDisplayMedia = undefined;
+      }
+    };
+  </script>
+</body>
+</html>

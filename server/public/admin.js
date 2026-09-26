@@ -414,3 +414,47 @@ document.addEventListener('visibilitychange', () => {
 });
 
 boot();
+
+// ------------------------------------------------------------------ config
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/admin/config', { cache: 'no-store' });
+    if (res.ok) {
+      const config = await res.json();
+      $('toggleRequireSharedGuild').checked = config.requireSharedGuild;
+    }
+  } catch (err) {
+    console.error('Erro ao carregar configurações globais:', err);
+  }
+}
+
+$('toggleRequireSharedGuild').addEventListener('change', async (e) => {
+  const checkbox = e.target;
+  const originalState = !checkbox.checked;
+  checkbox.disabled = true;
+
+  try {
+    const res = await fetch('/api/admin/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requireSharedGuild: checkbox.checked })
+    });
+    
+    if (!res.ok) throw new Error('Falha ao salvar configuração');
+    
+    // Feedback visual de sucesso sutil
+    const parent = checkbox.closest('.config-item');
+    parent.style.transition = 'background-color 0.3s';
+    parent.style.backgroundColor = 'rgba(74, 222, 128, 0.1)';
+    setTimeout(() => parent.style.backgroundColor = 'transparent', 800);
+  } catch (err) {
+    console.error(err);
+    alert('Erro ao salvar configuração.');
+    checkbox.checked = originalState; // rollback
+  } finally {
+    checkbox.disabled = false;
+  }
+});
+
+loadConfig();

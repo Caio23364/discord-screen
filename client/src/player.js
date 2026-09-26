@@ -39,7 +39,7 @@
  * assistindo alguém jogar. Quem precisa de menos atraso do que isso está
  * conversando, não assistindo — e aí a conversa é por voz do Discord.
  */
-const BUFFER_MS = 80;
+const BUFFER_MS = 150;
 
 /**
  * Teto da fila. Além disso a espera deixou de ser buffer e virou atraso.
@@ -48,7 +48,7 @@ const BUFFER_MS = 80;
  * relógio das duas máquinas anda em velocidades diferentes. Preferir descartar
  * é o mesmo princípio do encoder: atraso acumulado nunca mais sai sozinho.
  */
-const FILA_MAX = 12;
+const FILA_MAX = 60;
 
 /** De quanto em quanto tempo a espera é reavaliada, e sobre qual janela. */
 const AJUSTE_MS = 2000;
@@ -61,23 +61,25 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
   let gl = canvas.getContext('webgl2', { alpha: false, desynchronized: true });
   let ctx = null;
   
-  let program = null;
   let tex = null;
   let locResolution = null;
   let locSharpness = null;
+  let locSaturation = null;
+  let fsrStrength = 1.5;
+  let saturation = 1.0;
   let fsrEnabled = false;
 
   if (gl && typeof gl.createProgram === 'function') {
     isWebGL = true;
     const vsSource = "#version 300 es\nin vec2 a_position;\nin vec2 a_texcoord;\nout vec2 v_texcoord;\nvoid main() {\n  gl_Position = vec4(a_position, 0.0, 1.0);\n  v_texcoord = a_texcoord;\n}";
-    const fsSource = "#version 300 es\nprecision highp float;\nin vec2 v_texcoord;\nuniform sampler2D u_texture;\nuniform vec2 u_resolution;\nuniform float u_sharpness;\nout vec4 outColor;\nvoid main() {\n  if (u_sharpness <= 0.0) {\n    outColor = texture(u_texture, v_texcoord);\n    return;\n  }\n  vec2 step = 1.0 / u_resolution;\n  vec3 c = texture(u_texture, v_texcoord).rgb;\n  vec3 tc = texture(u_texture, v_texcoord + vec2(0.0, -step.y)).rgb;\n  vec3 bc = texture(u_texture, v_texcoord + vec2(0.0, step.y)).rgb;\n  vec3 lc = texture(u_texture, v_texcoord + vec2(-step.x, 0.0)).rgb;\n  vec3 rc = texture(u_texture, v_texcoord + vec2(step.x, 0.0)).rgb;\n  vec3 blurred = (tc + bc + lc + rc) * 0.25;\n  vec3 sharp = c + (c - blurred) * u_sharpness;\n  outColor = vec4(sharp, 1.0);\n}";
+    const fsSource = "#version 300 es\nprecision highp float;\nin vec2 v_texcoord;\nuniform sampler2D u_texture;\nuniform vec2 u_resolution;\nuniform float u_sharpness;\nuniform float u_saturation;\nout vec4 outColor;\nvoid main() {\n  vec3 sharp;\n  if (u_sharpness <= 0.0) {\n    sharp = texture(u_texture, v_texcoord).rgb;\n  } else {\n    vec2 step = 1.0 / u_resolution;\n    vec3 c = texture(u_texture, v_texcoord).rgb;\n    vec3 tc = texture(u_texture, v_texcoord + vec2(0.0, -step.y)).rgb;\n    vec3 bc = texture(u_texture, v_texcoord + vec2(0.0, step.y)).rgb;\n    vec3 lc = texture(u_texture, v_texcoord + vec2(-step.x, 0.0)).rgb;\n    vec3 rc = texture(u_texture, v_texcoord + vec2(step.x, 0.0)).rgb;\n    vec3 blurred = (tc + bc + lc + rc) * 0.25;\n    sharp = c + (c - blurred) * u_sharpness;\n  }\n  vec3 lumaWeights = vec3(0.299, 0.587, 0.114);\n  float luma = dot(sharp, lumaWeights);\n  vec3 finalColor = mix(vec3(luma), sharp, u_saturation);\n  outColor = vec4(finalColor, 1.0);\n}";
     const compile = (type, src) => {
       const shader = gl.createShader(type);
       gl.shaderSource(shader, src);
       gl.compileShader(shader);
       return shader;
     };
-    program = gl.createProgram();
+    const program = gl.createProgram();
     gl.attachShader(program, compile(gl.VERTEX_SHADER, vsSource));
     gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fsSource));
     gl.linkProgram(program);
@@ -103,6 +105,7 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
 
     locResolution = gl.getUniformLocation(program, 'u_resolution');
     locSharpness = gl.getUniformLocation(program, 'u_sharpness');
+    locSaturation = gl.getUniformLocation(program, 'u_saturation');
 
     tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -114,12 +117,15 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   }
 
-  function setFSR(enabled) {
-    fsrEnabled = enabled;
+  function setVideoSettings(options) {
+    if (options.fsrEnabled !== undefined) fsrEnabled = options.fsrEnabled;
+    if (options.fsrStrength !== undefined) fsrStrength = options.fsrStrength;
+    if (options.saturation !== undefined) saturation = options.saturation;
   }
 
   let decoder = null;
   let needKeyframe = true;
+  let lastKeyframeReq = 0;
   let lastLagMs = 0;
   let framesDrawn = 0;
 
@@ -147,7 +153,7 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
   let lastRawConfig = null;
 
   function start(rawConfig) {
-    stop();
+    stop(true);
     lastRawConfig = rawConfig;
 
     if (!window.VideoDecoder) {
@@ -164,7 +170,11 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
         // pedir um keyframe recupera sem derrubar a sessão.
         console.warn('[decoder]', err.message);
         needKeyframe = true;
-        onNeedKeyframe?.();
+        const now = Date.now();
+        if (now - lastKeyframeReq > 2000) {
+          lastKeyframeReq = now;
+          onNeedKeyframe?.();
+        }
         if (lastRawConfig) setTimeout(() => start(lastRawConfig), 10);
       },
     });
@@ -189,7 +199,14 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     const isKeyframe = view.getUint8(1) === 1;
 
     // Decoder frio só aceita keyframe; deltas antes disso viram erro.
-    if (needKeyframe && !isKeyframe) return;
+    if (needKeyframe && !isKeyframe) {
+      const now = Date.now();
+      if (now - lastKeyframeReq > 2000) {
+        lastKeyframeReq = now;
+        onNeedKeyframe?.();
+      }
+      return;
+    }
 
     const timestamp = view.getFloat64(2);
     const sentAt = view.getFloat64(10);
@@ -223,10 +240,10 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     const exibirEm = base + tsMs;
     const folga = exibirEm - agora;
 
-    // Chegou depois da própria hora — a rede engasgou e a referência ficou
+    // Chegou depois da própria hora — a rede engasgou severamente e a referência ficou
     // otimista demais. Reancorar aqui custa um solavanco só, contra um quadro
     // atrasado a cada quadro se a referência ficasse como está.
-    if (folga < -BUFFER_MS) {
+    if (folga < -Math.max(160, BUFFER_MS * 2)) {
       esvaziar();
       reancorar(agora, tsMs);
       pintar(frame);
@@ -332,7 +349,8 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
         gl.uniform2f(locResolution, canvas.width, canvas.height);
-        gl.uniform1f(locSharpness, fsrEnabled ? 1.5 : 0.0);
+        gl.uniform1f(locSharpness, fsrEnabled ? fsrStrength : 0.0);
+        gl.uniform1f(locSaturation, fsrEnabled ? saturation : 1.0);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       } catch (err) {
         console.warn('[webgl] Falha ao renderizar quadro, voltando para 2D:', err.message);
@@ -369,7 +387,7 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     }
   }
 
-  function stop() {
+  function stop(preserveFrame = false) {
     if (decoder && decoder.state !== 'closed') {
       try {
         decoder.close();
@@ -384,7 +402,7 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     base = null;
     ultimoTs = -Infinity;
     irregularidade = null;
-    if (canvas.width && canvas.height) {
+    if (!preserveFrame && canvas.width && canvas.height) {
       if (isWebGL) {
         gl.clearColor(0, 0, 0, 1);
         gl.clear(gl.COLOR_BUFFER_BIT);
@@ -422,7 +440,7 @@ export function createPlayer(canvas, { onError, onTamanho, onNeedKeyframe, onFal
     return n;
   }
 
-  return { start, push, stop, getLag, getJitter, takeFrameCount, getSizes, setFSR };
+  return { start, push, stop, getLag, getJitter, takeFrameCount, getSizes, setVideoSettings, get isWebGL() { return isWebGL; }, needsKeyframe: () => needKeyframe };
 }
 
 function deserialize(c) {
@@ -434,6 +452,13 @@ function deserialize(c) {
     // quadros antes de emitir o primeiro.
     optimizeForLatency: true,
   };
+
+  // Sem isto o decoder presume avcC. Quando quem transmite negociou annexb
+  // (o candidato preferido, ver shared/broadcaster.js), o bitstream chega com
+  // start codes e o decoder recusa todo quadro — inclusive o keyframe, então
+  // o pedido de keyframe do erro nunca se recupera e a tela fica carregando
+  // para sempre.
+  if (c.avc) out.avc = c.avc;
 
   if (c.description) {
     const bin = atob(c.description);
